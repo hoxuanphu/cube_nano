@@ -93,7 +93,7 @@ Dự án hiện đang đóng khung bài toán cloud detection thành **Image-lev
 ### ⚠️ Điểm cần cải thiện
 - ~~**Thiếu seed**~~ → **Đính chính:** notebook có `set_seed()`. ✅ **Đã backport** về `src/train.py`.
 - **Thiếu Early Stopping**: 20 epochs cứng → có thể overfitting hoặc lãng phí compute
-- **Thiếu logging**: Không TensorBoard/WandB → khó theo dõi learning curve
+- ~~**Thiếu logging**: Không TensorBoard/WandB → khó theo dõi learning curve~~ → ✅ **Đã bổ sung** W&B logging tùy chọn trong `src/train.py` và cấu hình Kaggle Secret trong notebook.
 - **LR = 1e-3 cho pretrained model**: Hơi cao. Thường fine-tune pretrained nên dùng 1e-4 ~ 3e-4, hoặc dùng discriminative learning rates (backbone lr thấp hơn classifier lr)
 - **Không có gradient clipping**: Với BCEWithLogitsLoss + AdamW thường ổn, nhưng nên có để an toàn
 
@@ -142,7 +142,7 @@ Tài liệu [multichannel_training_strategy.md](./multichannel_training_strategy
 | Kiến trúc model | ⭐⭐⭐⭐ | Phù hợp target, pretrained tốt |
 | Framing bài toán | ⭐⭐⭐⭐ | Classification patch-level hợp lý cho on-board screening |
 | Data pipeline | ⭐⭐⭐⭐ | Scene-level split + pos_weight đã có (notebook → backported) |
-| Training pipeline | ⭐⭐⭐½ | Seed + AMP backported. Vẫn thiếu early stopping, logging |
+| Training pipeline | ⭐⭐⭐⭐ | Seed + AMP backported, đã có W&B logging. Vẫn thiếu early stopping |
 | Deployment pipeline | ⭐⭐⭐⭐½ | TensorRT pipeline chuẩn, tile-based reading đã thêm |
 | Documentation | ⭐⭐⭐⭐⭐ | Multichannel strategy doc rất tốt |
 | Production readiness | ⭐⭐⭐½ | Configurable threshold đã thêm. Cần thêm monitoring |
@@ -162,8 +162,7 @@ Tài liệu [multichannel_training_strategy.md](./multichannel_training_strategy
 
 ### Còn lại nên cải thiện
 1. **Early stopping** theo val F1 patience
-2. **Logging** (TensorBoard/WandB)
-3. **Discriminative learning rates** (backbone lr < classifier lr)
+2. **Discriminative learning rates** (backbone lr < classifier lr)
 
 ---
 

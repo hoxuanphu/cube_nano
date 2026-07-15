@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -22,6 +23,7 @@ from inference_large_image_trt import (  # noqa: E402
     calculate_cloud_coverage,
     is_image_accepted,
 )
+from train import initialize_wandb  # noqa: E402
 
 
 def make_processed_dirs(root):
@@ -252,6 +254,39 @@ class LargeImageInferenceTests(unittest.TestCase):
     def test_cloud_coverage_threshold_is_validated(self):
         with self.assertRaisesRegex(ValueError, "between 0 and 1"):
             is_image_accepted(np.zeros((2, 2), dtype=np.uint8), 1.1)
+
+
+class WandbLoggingTests(unittest.TestCase):
+    def test_initialize_wandb_passes_tracking_configuration(self):
+        fake_wandb = mock.Mock()
+        fake_run = mock.Mock()
+        fake_wandb.init.return_value = fake_run
+        args = SimpleNamespace(
+            wandb=True,
+            wandb_project="cube-nano",
+            wandb_entity="example-team",
+            wandb_run_name="baseline-rgbnir",
+            wandb_group="95-cloud",
+            wandb_tags=["kaggle", "baseline"],
+            wandb_mode="offline",
+            out_dir="checkpoints",
+        )
+        training_config = {"epochs": 2, "channels": 4}
+
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            result = initialize_wandb(args, training_config)
+
+        self.assertIs(result, fake_run)
+        fake_wandb.init.assert_called_once_with(
+            project="cube-nano",
+            entity="example-team",
+            name="baseline-rgbnir",
+            group="95-cloud",
+            tags=["kaggle", "baseline"],
+            config=training_config,
+            dir="checkpoints",
+            mode="offline",
+        )
 
 
 if __name__ == "__main__":

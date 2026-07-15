@@ -7,3 +7,4 @@ onnx
 Pillow
 h5py
 netCDF4
+wandb

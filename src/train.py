@@ -130,6 +130,31 @@ def val_epoch(model, dataloader, criterion, device, threshold=0.5):
     
     return avg_loss, acc, prec, rec, f1
 
+
+def initialize_wandb(args, training_config):
+    """Create an optional Weights & Biases run without making it a hard dependency."""
+    if not args.wandb:
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "W&B logging was requested but the 'wandb' package is not installed. "
+            "Install it with: pip install wandb"
+        ) from exc
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        config=training_config,
+        dir=args.out_dir,
+        mode=args.wandb_mode,
+    )
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, default='data/processed/train', help='Train data dir')
@@ -156,6 +181,16 @@ def main():
     parser.add_argument('--amp', action='store_true', default=True, help='Use Automatic Mixed Precision (AMP) training')
     parser.add_argument('--no_amp', dest='amp', action='store_false', help='Disable AMP')
     parser.add_argument('--threshold', type=float, default=0.5, help='Probability threshold for classification metrics')
+    parser.add_argument('--wandb', action='store_true', help='Log training metrics to Weights & Biases')
+    parser.add_argument('--wandb_project', type=str, default='cube-nano', help='W&B project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='Optional W&B team/entity')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='Optional W&B run name')
+    parser.add_argument('--wandb_group', type=str, default=None, help='Optional W&B run group')
+    parser.add_argument('--wandb_tags', nargs='*', default=None, help='Optional W&B run tags')
+    parser.add_argument(
+        '--wandb_mode', choices=('online', 'offline', 'disabled'), default='online',
+        help='W&B logging mode',
+    )
     args = parser.parse_args()
 
     # Reproducibility
@@ -237,6 +272,12 @@ def main():
         'estimated_clear_crops': estimated_clear_crops,
         'pos_weight': pos_weight_value,
         'amp': args.amp and device.type == 'cuda',
+        'wandb_enabled': args.wandb,
+        'wandb_project': args.wandb_project if args.wandb else None,
+        'wandb_entity': args.wandb_entity if args.wandb else None,
+        'wandb_group': args.wandb_group if args.wandb else None,
+        'wandb_tags': args.wandb_tags if args.wandb else None,
+        'wandb_mode': args.wandb_mode if args.wandb else None,
     }
     config_path = os.path.join(args.out_dir, 'training_config.json')
     with open(config_path, 'w', encoding='utf-8') as f:
@@ -256,31 +297,75 @@ def main():
     best_f1 = -1.0
     best_model_path = os.path.join(args.out_dir, 'best_model.pth')
     last_model_path = os.path.join(args.out_dir, 'last_model.pth')
-    
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
-        train_loss, train_acc, train_prec, train_rec, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler=scaler, threshold=args.threshold
-        )
-        print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Prec: {train_prec:.4f} | Rec: {train_rec:.4f} | F1: {train_f1:.4f}")
-        torch.save(model.state_dict(), last_model_path)
-        
-        if val_loader:
-            val_loss, val_acc, val_prec, val_rec, val_f1 = val_epoch(
-                model, val_loader, criterion, device, threshold=args.threshold
+    wandb_run = initialize_wandb(args, training_config)
+    if wandb_run is not None:
+        wandb_metadata = {
+            'id': getattr(wandb_run, 'id', None),
+            'name': getattr(wandb_run, 'name', None),
+            'project': getattr(wandb_run, 'project', args.wandb_project),
+            'entity': getattr(wandb_run, 'entity', args.wandb_entity),
+            'url': getattr(wandb_run, 'url', None),
+            'mode': args.wandb_mode,
+        }
+        wandb_metadata_path = os.path.join(args.out_dir, 'wandb_run.json')
+        with open(wandb_metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(wandb_metadata, f, indent=2)
+        print(f"W&B run: {wandb_metadata['url'] or wandb_metadata['id']}")
+
+    try:
+        for epoch in range(args.epochs):
+            epoch_number = epoch + 1
+            learning_rate = optimizer.param_groups[0]['lr']
+            print(f"\nEpoch {epoch_number}/{args.epochs}")
+            train_loss, train_acc, train_prec, train_rec, train_f1 = train_epoch(
+                model, train_loader, criterion, optimizer, device, scaler=scaler, threshold=args.threshold
             )
-            print(f"Val - Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | F1: {val_f1:.4f}")
-            
-            if val_f1 > best_f1:
-                best_f1 = val_f1
+            print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Prec: {train_prec:.4f} | Rec: {train_rec:.4f} | F1: {train_f1:.4f}")
+            torch.save(model.state_dict(), last_model_path)
+
+            epoch_metrics = {
+                'epoch': epoch_number,
+                'learning_rate': learning_rate,
+                'train/loss': train_loss,
+                'train/accuracy': train_acc,
+                'train/precision': train_prec,
+                'train/recall': train_rec,
+                'train/f1': train_f1,
+            }
+
+            if val_loader:
+                val_loss, val_acc, val_prec, val_rec, val_f1 = val_epoch(
+                    model, val_loader, criterion, device, threshold=args.threshold
+                )
+                print(f"Val - Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | F1: {val_f1:.4f}")
+
+                if val_f1 > best_f1:
+                    best_f1 = val_f1
+                    torch.save(model.state_dict(), best_model_path)
+                    print("Saved new best model!")
+
+                epoch_metrics.update({
+                    'val/loss': val_loss,
+                    'val/accuracy': val_acc,
+                    'val/precision': val_prec,
+                    'val/recall': val_rec,
+                    'val/f1': val_f1,
+                    'val/best_f1': best_f1,
+                })
+            else:
                 torch.save(model.state_dict(), best_model_path)
-                print("Saved new best model!")
-        else:
-            torch.save(model.state_dict(), best_model_path)
-            torch.save(model.state_dict(), os.path.join(args.out_dir, f'model_epoch_{epoch+1}.pth'))
-            print("Saved current model as best_model.pth (no validation set available).")
-            
-        scheduler.step()
+                torch.save(model.state_dict(), os.path.join(args.out_dir, f'model_epoch_{epoch_number}.pth'))
+                print("Saved current model as best_model.pth (no validation set available).")
+
+            if wandb_run is not None:
+                wandb_run.log(epoch_metrics, step=epoch_number)
+
+            scheduler.step()
+    finally:
+        if wandb_run is not None:
+            if best_f1 >= 0.0:
+                wandb_run.summary['best_val_f1'] = best_f1
+            wandb_run.finish()
 
 if __name__ == '__main__':
     main()
