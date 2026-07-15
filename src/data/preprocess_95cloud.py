@@ -1,13 +1,17 @@
 """Convert the 95-Cloud TIFF dataset into paired image and mask patches.
 
-Expected input layout (the layout distributed by Kaggle):
+Canonical input layout:
     <data_dir>/train_{red,green,blue,nir,gt}/<channel>_<scene>.TIF
+
+Nested Kaggle layouts are also supported when the band can be inferred from
+the TIFF filename or one of its parent directory names.
 
 Output images are grouped by their source-patch label while masks are stored in
 a separate ``masks`` directory with matching filenames.
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +20,97 @@ from tqdm import tqdm
 
 
 CHANNELS = ("red", "green", "blue", "nir")
+SUPPORTED_SUFFIXES = {".tif", ".tiff"}
+BAND_ALIASES = {
+    "red": ("red",),
+    "green": ("green",),
+    "blue": ("blue",),
+    "nir": ("nir", "near_infrared", "nearinfrared"),
+    "gt": ("gt", "mask", "masks", "label", "labels", "ground_truth", "groundtruth"),
+}
+
+
+def _normalized_name(value):
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def _detect_band(path):
+    """Infer a band from a TIFF filename or one of its parent directories."""
+    path = Path(path)
+    stem = _normalized_name(path.stem)
+    for band, aliases in BAND_ALIASES.items():
+        if any(stem == alias or stem.startswith(f"{alias}_") for alias in aliases):
+            return band
+
+    for parent in reversed(path.parents[:4]):
+        name = _normalized_name(parent.name)
+        tokens = set(name.split("_"))
+        for band, aliases in BAND_ALIASES.items():
+            if any(alias in tokens or name == alias or name.endswith(f"_{alias}") for alias in aliases):
+                return band
+    return None
+
+
+def _scene_id(path, band):
+    """Normalize filenames from band-specific folders to one scene identifier."""
+    stem = _normalized_name(Path(path).stem)
+    aliases = BAND_ALIASES[band]
+    for alias in aliases:
+        for prefix in (f"{alias}_", f"train_{alias}_"):
+            if stem.startswith(prefix):
+                return stem[len(prefix):]
+        for suffix in (f"_{alias}", f"_train_{alias}"):
+            if stem.endswith(suffix):
+                return stem[:-len(suffix)]
+    return stem
+
+
+def discover_scene_files(data_dir, channels=4):
+    """Discover complete 95-Cloud scenes across common Kaggle layouts."""
+    data_dir = Path(data_dir)
+    if channels not in (3, 4):
+        raise ValueError(f"channels must be 3 or 4, got {channels}")
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"95-Cloud directory not found: {data_dir}")
+
+    records = {}
+    band_counts = {band: 0 for band in (*CHANNELS, "gt")}
+    sample_paths = []
+    for path in data_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            continue
+        if len(sample_paths) < 10:
+            sample_paths.append(str(path.relative_to(data_dir)))
+        band = _detect_band(path)
+        if band is None:
+            continue
+        scene = _scene_id(path, band)
+        if not scene:
+            continue
+        scene_record = records.setdefault(scene, {})
+        if band in scene_record and scene_record[band] != path:
+            raise ValueError(
+                f"Duplicate {band} files for scene {scene}: "
+                f"{scene_record[band]} and {path}"
+            )
+        scene_record[band] = path
+        band_counts[band] += 1
+
+    required_bands = set(CHANNELS[:channels]) | {"gt"}
+    complete = {
+        scene: record
+        for scene, record in records.items()
+        if required_bands.issubset(record)
+    }
+    if not complete:
+        top_level = sorted(path.name for path in data_dir.iterdir())[:30]
+        raise FileNotFoundError(
+            "Could not find complete 95-Cloud scenes. "
+            f"root={data_dir}, required_bands={sorted(required_bands)}, "
+            f"detected_band_counts={band_counts}, top_level={top_level}, "
+            f"sample_tiff_paths={sample_paths}"
+        )
+    return dict(sorted(complete.items()))
 
 
 def _find_file(folder: Path, prefix: str, scene: str) -> Path | None:
@@ -78,6 +173,7 @@ def process_scene(
     patch_size=384,
     cloud_ratio_threshold=0.10,
     channels=4,
+    scene_files=None,
 ):
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
@@ -87,16 +183,14 @@ def process_scene(
         raise ValueError(f"channels must be 3 or 4, got {channels}")
     _validate_cloud_ratio_threshold(cloud_ratio_threshold)
 
-    channel_dirs = {name: data_dir / f"train_{name}" for name in CHANNELS}
     names = CHANNELS[:channels]
-    files = {name: _find_file(channel_dirs[name], name, scene) for name in names}
-    gt_file = _find_file(data_dir / "train_gt", "gt", scene)
-
-    missing = [str(channel_dirs[name]) for name, path in files.items() if path is None]
-    if gt_file is None:
-        missing.append(str(data_dir / "train_gt"))
-    if missing:
-        raise FileNotFoundError(f"Missing 95-Cloud files for scene {scene}: {', '.join(missing)}")
+    if scene_files is None:
+        discovered = discover_scene_files(data_dir, channels=channels)
+        if scene not in discovered:
+            raise FileNotFoundError(f"Scene {scene} not found under {data_dir}")
+        scene_files = discovered[scene]
+    files = {name: Path(scene_files[name]) for name in names}
+    gt_file = Path(scene_files["gt"])
 
     arrays = [tiff.imread(files[name]) for name in names]
     gt = tiff.imread(gt_file)
@@ -165,17 +259,8 @@ def main():
         for path in existing:
             path.unlink()
 
-    red_dir = data_dir / "train_red"
-    if not red_dir.is_dir():
-        raise FileNotFoundError(
-            f"Could not find {red_dir}. Extract 95-Cloud so it contains train_red, "
-            "train_green, train_blue, train_nir and train_gt."
-        )
-
-    scenes = sorted({path.stem[4:] for path in red_dir.iterdir()
-                     if path.is_file() and path.stem.lower().startswith("red_")})
-    if not scenes:
-        raise ValueError(f"No red_*.TIF files found in {red_dir}")
+    scene_files = discover_scene_files(data_dir, channels=args.channels)
+    scenes = sorted(scene_files)
 
     for scene in tqdm(scenes, desc="95-Cloud"):
         process_scene(
@@ -185,6 +270,7 @@ def main():
             args.patch_size,
             args.cloud_ratio_threshold,
             args.channels,
+            scene_files[scene],
         )
     patch_count = validate_output_pairs(output_dir)
     print(

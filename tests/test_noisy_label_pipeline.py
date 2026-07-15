@@ -17,7 +17,11 @@ sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(DATA_SRC))
 
 from data.cloud_dataset import CloudDataset  # noqa: E402
-from data.preprocess_95cloud import process_scene, validate_output_pairs  # noqa: E402
+from data.preprocess_95cloud import (  # noqa: E402
+    discover_scene_files,
+    process_scene,
+    validate_output_pairs,
+)
 from data import split_dataset  # noqa: E402
 from inference_large_image_trt import (  # noqa: E402
     calculate_cloud_coverage,
@@ -37,6 +41,27 @@ def save_pair(root, label, filename, image, mask):
 
 
 class Preprocess95CloudTests(unittest.TestCase):
+    def test_discovers_nested_band_directories_without_filename_prefixes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = np.arange(100, dtype=np.uint16).reshape(10, 10)
+            layout = {
+                "red": root / "95-cloud" / "Training" / "Red",
+                "green": root / "95-cloud" / "Training" / "Green",
+                "blue": root / "95-cloud" / "Training" / "Blue",
+                "nir": root / "95-cloud" / "Training" / "NIR",
+                "gt": root / "95-cloud" / "Training" / "Ground Truth",
+            }
+            for band, directory in layout.items():
+                directory.mkdir(parents=True, exist_ok=True)
+                values = np.zeros_like(image) if band == "gt" else image
+                tiff.imwrite(directory / "scene_a.TIF", values)
+
+            scenes = discover_scene_files(root, channels=4)
+
+            self.assertEqual(set(scenes), {"scene_a"})
+            self.assertEqual(set(scenes["scene_a"]), {"red", "green", "blue", "nir", "gt"})
+
     def test_process_scene_saves_binary_mask_pairs_at_ten_percent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
