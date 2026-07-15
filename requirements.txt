@@ -1,0 +1,9 @@
+torch
+torchvision
+numpy
+tifffile
+tqdm
+onnx
+Pillow
+h5py
+netCDF4
