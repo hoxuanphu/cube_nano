@@ -104,15 +104,19 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler=None, th
     
     return avg_loss, acc, prec, rec, f1
 
-def val_epoch(model, dataloader, criterion, device, threshold=0.5):
+def val_epoch(model, dataloader, criterion, device, threshold=0.5, return_details=False):
     model.eval()
     total_loss = 0.0
     all_preds = []
     all_labels = []
+    sample_inputs = None
     
     with torch.no_grad():
         for inputs, labels in tqdm(dataloader, desc="Validation"):
             inputs, labels = inputs.to(device), labels.to(device)
+
+            if sample_inputs is None:
+                sample_inputs = inputs[:8].detach().cpu()
             
             outputs = model(inputs).squeeze(1)
             loss = criterion(outputs, labels)
@@ -128,7 +132,99 @@ def val_epoch(model, dataloader, criterion, device, threshold=0.5):
     all_labels = torch.cat(all_labels)
     acc, prec, rec, f1 = calculate_metrics(all_preds, all_labels, threshold)
     
-    return avg_loss, acc, prec, rec, f1
+    metrics = (avg_loss, acc, prec, rec, f1)
+    if return_details:
+        return metrics + (all_preds, all_labels, sample_inputs)
+    return metrics
+
+
+def log_wandb_classification_artifacts(
+    wandb_run,
+    logits,
+    labels,
+    threshold,
+    prefix,
+    step=None,
+    sample_inputs=None,
+):
+    """Log curves, confusion matrix and representative inputs to W&B."""
+    if wandb_run is None:
+        return
+
+    import wandb
+
+    probabilities = torch.sigmoid(logits).numpy()
+    y_true = labels.to(torch.int64).numpy()
+    y_pred = (probabilities >= threshold).astype(np.int64)
+    class_probabilities = np.column_stack((1.0 - probabilities, probabilities))
+
+    logs = {
+        f'{prefix}/confusion_matrix': wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=y_true.tolist(),
+            preds=y_pred.tolist(),
+            class_names=['clear', 'cloud'],
+        ),
+        f'{prefix}/roc_curve': wandb.plot.roc_curve(
+            y_true,
+            class_probabilities,
+            labels=['clear', 'cloud'],
+        ),
+        f'{prefix}/pr_curve': wandb.plot.pr_curve(
+            y_true,
+            class_probabilities,
+            labels=['clear', 'cloud'],
+        ),
+    }
+
+    if sample_inputs is not None:
+        sample_images = []
+        nir_images = []
+        for index, image in enumerate(sample_inputs[:8]):
+            image = image.float().clamp(0.0, 1.0)
+            probability = float(probabilities[index])
+            caption = (
+                f"true={'cloud' if y_true[index] else 'clear'}; "
+                f"cloud_probability={probability:.4f}"
+            )
+            rgb = image[:3].permute(1, 2, 0).numpy()
+            sample_images.append(wandb.Image(rgb, caption=caption))
+            if image.shape[0] >= 4:
+                nir_images.append(wandb.Image(image[3].numpy(), caption=caption))
+
+        if sample_images:
+            logs[f'{prefix}/sample_rgb'] = sample_images
+        if nir_images:
+            logs[f'{prefix}/sample_nir'] = nir_images
+
+    wandb_run.log(logs, step=step)
+
+
+def log_wandb_model_artifact(wandb_run, args, best_model_path, last_model_path, config_path, best_f1):
+    """Upload model checkpoints and their training config as one W&B artifact."""
+    if wandb_run is None or args.wandb_mode == 'disabled':
+        return
+
+    import wandb
+
+    artifact = wandb.Artifact(
+        name=f'cloud-model-{wandb_run.id}',
+        type='model',
+        metadata={
+            'best_val_f1': best_f1 if best_f1 >= 0.0 else None,
+            'channels': args.channels,
+            'crop_size': args.crop_size,
+            'probability_threshold': args.threshold,
+        },
+    )
+    for path, artifact_name in (
+        (best_model_path, 'best_model.pth'),
+        (last_model_path, 'last_model.pth'),
+        (config_path, 'training_config.json'),
+    ):
+        if os.path.isfile(path):
+            artifact.add_file(path, name=artifact_name)
+    wandb_run.log_artifact(artifact)
 
 
 def initialize_wandb(args, training_config):
@@ -214,6 +310,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     
     val_loader = None
+    val_dataset = None
     if os.path.exists(args.val_dir):
         val_dataset = CloudDataset(
             args.val_dir,
@@ -257,6 +354,8 @@ def main():
         'dataset_name': '95-Cloud',
         'train_dir': args.train_dir,
         'val_dir': args.val_dir,
+        'train_samples': len(train_dataset),
+        'val_samples': len(val_dataset) if val_dataset is not None else 0,
         'channels': args.channels,
         'crop_size': args.crop_size,
         'cloud_ratio_threshold': args.cloud_ratio_threshold,
@@ -332,14 +431,34 @@ def main():
                 'train/recall': train_rec,
                 'train/f1': train_f1,
             }
+            is_best = False
 
             if val_loader:
-                val_loss, val_acc, val_prec, val_rec, val_f1 = val_epoch(
-                    model, val_loader, criterion, device, threshold=args.threshold
+                val_result = val_epoch(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    threshold=args.threshold,
+                    return_details=wandb_run is not None,
                 )
+                if wandb_run is not None:
+                    (
+                        val_loss,
+                        val_acc,
+                        val_prec,
+                        val_rec,
+                        val_f1,
+                        val_logits,
+                        val_labels,
+                        val_sample_inputs,
+                    ) = val_result
+                else:
+                    val_loss, val_acc, val_prec, val_rec, val_f1 = val_result
                 print(f"Val - Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | F1: {val_f1:.4f}")
 
-                if val_f1 > best_f1:
+                is_best = val_f1 > best_f1
+                if is_best:
                     best_f1 = val_f1
                     torch.save(model.state_dict(), best_model_path)
                     print("Saved new best model!")
@@ -359,12 +478,30 @@ def main():
 
             if wandb_run is not None:
                 wandb_run.log(epoch_metrics, step=epoch_number)
+                if is_best:
+                    log_wandb_classification_artifacts(
+                        wandb_run,
+                        val_logits,
+                        val_labels,
+                        threshold=args.threshold,
+                        prefix='val',
+                        step=epoch_number,
+                        sample_inputs=val_sample_inputs,
+                    )
 
             scheduler.step()
     finally:
         if wandb_run is not None:
             if best_f1 >= 0.0:
                 wandb_run.summary['best_val_f1'] = best_f1
+            log_wandb_model_artifact(
+                wandb_run,
+                args,
+                best_model_path,
+                last_model_path,
+                config_path,
+                best_f1,
+            )
             wandb_run.finish()
 
 if __name__ == '__main__':

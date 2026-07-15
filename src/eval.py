@@ -8,7 +8,7 @@ import json
 
 from data.cloud_dataset import CloudDataset
 from models.mobilenetv3 import get_cloud_model
-from train import calculate_metrics, set_seed
+from train import calculate_metrics, log_wandb_classification_artifacts, set_seed
 
 def main():
     parser = argparse.ArgumentParser()
@@ -24,6 +24,14 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed recorded for reproducibility')
     parser.add_argument('--threshold', type=float, default=0.5, help='Probability threshold for classification')
+    parser.add_argument('--wandb', action='store_true', help='Log test metrics and curves to Weights & Biases')
+    parser.add_argument('--wandb_project', type=str, default='cube-nano', help='W&B project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='Optional W&B team/entity')
+    parser.add_argument('--wandb_run_id', type=str, default=None, help='Existing W&B run ID to resume')
+    parser.add_argument(
+        '--wandb_mode', choices=('online', 'offline', 'disabled'), default='online',
+        help='W&B logging mode',
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -59,10 +67,14 @@ def main():
     total_loss = 0.0
     all_preds = []
     all_labels = []
+    sample_inputs = None
     
     with torch.no_grad():
         for inputs, labels in tqdm(test_loader, desc="Testing"):
             inputs, labels = inputs.to(device), labels.to(device)
+
+            if sample_inputs is None:
+                sample_inputs = inputs[:8].detach().cpu()
             
             outputs = model(inputs).squeeze(1)
             loss = criterion(outputs, labels)
@@ -83,6 +95,7 @@ def main():
             'dataset_name': '95-Cloud',
             'model_path': args.model_path,
             'test_dir': args.test_dir,
+            'test_samples': len(test_dataset),
             'channels': args.channels,
             'batch_size': args.batch_size,
             'crop_size': args.crop_size,
@@ -108,6 +121,46 @@ def main():
     with open('results/eval_metrics.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4)
     print("\nResults saved to results/eval_metrics.json")
+
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging was requested but the 'wandb' package is not installed. "
+                "Install it with: pip install wandb"
+            ) from exc
+
+        init_kwargs = {
+            'project': args.wandb_project,
+            'entity': args.wandb_entity,
+            'config': results['config'],
+            'mode': args.wandb_mode,
+        }
+        if args.wandb_run_id:
+            init_kwargs.update({'id': args.wandb_run_id, 'resume': 'must'})
+
+        wandb_run = wandb.init(**init_kwargs)
+        try:
+            wandb_run.log({
+                'test/loss': avg_loss,
+                'test/accuracy': acc,
+                'test/precision': prec,
+                'test/recall': rec,
+                'test/f1': f1,
+            })
+            log_wandb_classification_artifacts(
+                wandb_run,
+                all_preds,
+                all_labels,
+                threshold=args.threshold,
+                prefix='test',
+                sample_inputs=sample_inputs,
+            )
+            wandb_run.summary['test_f1'] = f1
+            wandb_run.summary['test_accuracy'] = acc
+        finally:
+            wandb_run.finish()
 
 if __name__ == '__main__':
     main()
