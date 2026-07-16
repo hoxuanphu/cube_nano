@@ -9,11 +9,18 @@ from pathlib import Path
 TIFF_EXTENSIONS = {".tif", ".tiff"}
 PIL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jp2", ".j2k", ".j2c"}
 NUMPY_EXTENSIONS = {".npy", ".npz"}
+HDF4_EXTENSIONS = {".h4", ".hdf4"}
 HDF5_EXTENSIONS = {".h5", ".hdf5", ".hdf"}
 NETCDF_EXTENSIONS = {".nc", ".netcdf"}
 SUPPORTED_IMAGE_EXTENSIONS = sorted(
-    TIFF_EXTENSIONS | PIL_EXTENSIONS | NUMPY_EXTENSIONS | HDF5_EXTENSIONS | NETCDF_EXTENSIONS
+    TIFF_EXTENSIONS
+    | PIL_EXTENSIONS
+    | NUMPY_EXTENSIONS
+    | HDF4_EXTENSIONS
+    | HDF5_EXTENSIONS
+    | NETCDF_EXTENSIONS
 )
+HDF4_MAGIC = b"\x0e\x03\x13\x01"
 
 
 def _missing_dependency(package_name, format_name):
@@ -109,6 +116,34 @@ def _read_hdf5(path, array_key=None):
         return np.asarray(dataset)
 
 
+def _is_hdf4_file(path):
+    """Return whether a path is explicitly HDF4 or has the HDF4 signature."""
+    path = Path(path)
+    if path.suffix.lower() in HDF4_EXTENSIONS:
+        return True
+    if path.suffix.lower() != ".hdf":
+        return False
+    try:
+        with path.open("rb") as file:
+            return file.read(len(HDF4_MAGIC)) == HDF4_MAGIC
+    except OSError:
+        return False
+
+
+def _hdf4_dataset_info(path, array_key=None):
+    from data.read_hdf4 import list_hdf4_datasets
+
+    datasets = {dataset.name: dataset for dataset in list_hdf4_datasets(path)}
+    return _select_array_from_mapping(datasets, array_key, path)
+
+
+def _read_hdf4(path, array_key=None):
+    from data.read_hdf4 import read_hdf4_dataset
+
+    dataset = _hdf4_dataset_info(path, array_key=array_key)
+    return read_hdf4_dataset(path, dataset_name=dataset.name)
+
+
 def _read_netcdf(path, array_key=None):
     try:
         from netCDF4 import Dataset
@@ -151,6 +186,8 @@ def _read_image(path, array_key=None):
         image = _read_numpy(path, array_key=array_key)
     elif suffix in PIL_EXTENSIONS:
         image = _read_with_pillow(path)
+    elif _is_hdf4_file(path):
+        image = _read_hdf4(path, array_key=array_key)
     elif suffix in HDF5_EXTENSIONS:
         image = _read_hdf5(path, array_key=array_key)
     elif suffix in NETCDF_EXTENSIONS:
@@ -261,6 +298,13 @@ def _get_image_shape(path, array_key=None):
             raise ValueError(f"Large-image inference expects multi-channel, got shape {shape} from {path}.")
         return _shape_to_hwc(shape)
 
+    if _is_hdf4_file(path):
+        info = _hdf4_dataset_info(path, array_key=array_key)
+        shape = info.shape
+        if len(shape) == 2:
+            raise ValueError(f"Large-image inference expects multi-channel, got shape {shape} from {path}.")
+        return _shape_to_hwc(shape)
+
     if suffix in HDF5_EXTENSIONS:
         try:
             import h5py
@@ -316,7 +360,7 @@ def _read_image_strip(path, row_start, row_end, array_key=None):
     Uses memory-efficient access where possible:
     - TIFF: memmap for uncompressed, full-read fallback for compressed
     - npy: numpy mmap_mode='r'
-    - HDF5/NetCDF: native partial read (dataset slicing)
+    - HDF4/HDF5/NetCDF: native partial read (dataset slicing)
     - PIL formats: full-read fallback
 
     Returns array in (H, W, C) layout, NOT normalized.
@@ -348,6 +392,26 @@ def _read_image_strip(path, row_start, row_end, array_key=None):
             loaded = np.load(path)
             arr = np.asarray(_select_array_from_mapping(loaded, array_key, path))
             return _slice_strip_from_array(arr, row_start, row_end)
+
+    if _is_hdf4_file(path):
+        from data.read_hdf4 import read_hdf4_dataset
+
+        info = _hdf4_dataset_info(path, array_key=array_key)
+        if _is_channel_first(info.shape):
+            start = [0, row_start, 0]
+            count = [info.shape[0], row_end - row_start, info.shape[2]]
+        else:
+            start = [row_start, 0, 0]
+            count = [row_end - row_start, info.shape[1], info.shape[2]]
+        strip = read_hdf4_dataset(
+            path,
+            dataset_name=info.name,
+            start=start,
+            count=count,
+        )
+        if _is_channel_first(info.shape):
+            return np.moveaxis(strip, 0, -1)
+        return np.asarray(strip)
 
     if suffix in HDF5_EXTENSIONS:
         try:
@@ -541,7 +605,7 @@ if __name__ == '__main__':
         "--array_key",
         type=str,
         default=None,
-        help="Array/dataset key for .npz, HDF5, or NetCDF inputs when the file contains multiple arrays.",
+        help="Array/dataset key for .npz, HDF4, HDF5, or NetCDF inputs when the file contains multiple arrays.",
     )
     parser.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for cloud classification")
     parser.add_argument(

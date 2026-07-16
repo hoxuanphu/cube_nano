@@ -6,5 +6,6 @@ tqdm
 onnx
 Pillow
 h5py
+pyhdf
 netCDF4
 wandb
