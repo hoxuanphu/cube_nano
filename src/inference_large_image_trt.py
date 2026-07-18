@@ -5,6 +5,17 @@ import argparse
 import os
 import tempfile
 from pathlib import Path
+from uuid import uuid4
+
+from input_contract import legacy_input_spec, load_engine_manifest
+from resource_guards import (
+    DiskAllocation,
+    FilesystemInfoProvider,
+    ReaderBudget,
+    require_disk_allocations,
+    require_writable_parents,
+)
+from tiff_reader import ImageBlockReader, ReaderMetrics, TiffReader, close_memmap
 
 TIFF_EXTENSIONS = {".tif", ".tiff"}
 PIL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jp2", ".j2k", ".j2c"}
@@ -199,21 +210,6 @@ def _read_image(path, array_key=None):
     return _ensure_supported_image_shape(image, path)
 
 
-def _normalize_patch(patch):
-    if np.issubdtype(patch.dtype, np.floating):
-        patch = patch.astype(np.float32)
-        if patch.max() > 1.0:
-            scale = 65535.0 if patch.max() > 255.0 else 255.0
-            patch = patch / scale
-        return np.clip(patch, 0.0, 1.0)
-
-    if np.issubdtype(patch.dtype, np.integer):
-        patch = patch.astype(np.float32) / float(np.iinfo(patch.dtype).max)
-        return np.clip(patch, 0.0, 1.0)
-
-    raise ValueError(f"Unsupported image dtype {patch.dtype}")
-
-
 def _pad_patch(patch, patch_size):
     padded = np.zeros((patch_size, patch_size, patch.shape[-1]), dtype=patch.dtype)
     padded[: patch.shape[0], : patch.shape[1], :] = patch
@@ -239,6 +235,8 @@ def _run_batch(trt_infer, batch_input):
     try:
         return trt_infer.infer_batch(batch_input)
     except ValueError as exc:
+        if "batch" not in str(exc).lower():
+            raise
         print(f"Batch inference unavailable: {exc}")
         preds = []
         probs = []
@@ -369,20 +367,7 @@ def _read_image_strip(path, row_start, row_end, array_key=None):
     suffix = path.suffix.lower()
 
     if suffix in TIFF_EXTENSIONS:
-        try:
-            import tifffile as tiff
-        except ImportError as exc:
-            raise _missing_dependency("tifffile", "TIFF/GeoTIFF") from exc
-        # Try memory-mapped access first (works for uncompressed TIFFs)
-        try:
-            mm = tiff.memmap(path)
-            strip = _slice_strip_from_array(mm, row_start, row_end)
-            return strip
-        except ValueError:
-            # Compressed TIFF — memmap not supported, fall back to full read
-            full = tiff.imread(path)
-            strip = _slice_strip_from_array(full, row_start, row_end)
-            return strip
+        raise RuntimeError("TIFF row reads must use a session-scoped TiffReader")
 
     if suffix in NUMPY_EXTENSIONS:
         if suffix == ".npy":
@@ -441,6 +426,136 @@ def _read_image_strip(path, row_start, row_end, array_key=None):
     return image[row_start:row_end]
 
 
+class _NativeImageReader(ImageBlockReader):
+    """Adapter for non-TIFF formats outside the TIFF remediation scope."""
+
+    def __init__(self, path, array_key=None):
+        self.path = Path(path)
+        self.array_key = array_key
+        self.shape = _get_image_shape(self.path, array_key=array_key)
+        self.dtype = None
+        self.axes = {"original": None, "normalized": "YXC"}
+        self.band_order = None
+        self.metrics = ReaderMetrics()
+
+    def read_rows(self, row_start, row_end):
+        return _read_image_strip(
+            self.path,
+            row_start,
+            row_end,
+            array_key=self.array_key,
+        )
+
+    def physical_blocks(self, row_start, row_end):
+        return ()
+
+    def close(self):
+        return None
+
+
+class _MaskCache:
+    def __init__(self, path, shape, owns_cache):
+        self.path = Path(path)
+        self.shape = tuple(shape)
+        self.owns_cache = bool(owns_cache)
+        self.array = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            raise FileExistsError(f"Mask cache path already exists: {self.path}")
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        descriptor = os.open(self.path, flags)
+        try:
+            os.ftruncate(descriptor, math.prod(self.shape))
+        finally:
+            os.close(descriptor)
+        try:
+            self.array = np.memmap(
+                self.path,
+                mode="r+",
+                dtype=np.uint8,
+                shape=self.shape,
+            )
+            self.array[:] = 0
+            return self.array
+        except Exception:
+            if self.owns_cache:
+                self.path.unlink(missing_ok=True)
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.array is not None:
+            close_memmap(self.array)
+            self.array = None
+        if self.owns_cache:
+            self.path.unlink(missing_ok=True)
+        return False
+
+
+def _atomic_write_tiff(path, image):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        _write_tiff(temporary_path, image)
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _resolve_input_spec(engine_path, engine_manifest, channels, patch_size):
+    if engine_manifest is None:
+        return legacy_input_spec(channels, patch_size)
+
+    input_spec = load_engine_manifest(engine_manifest, engine_path=engine_path)
+    if channels != input_spec.channels:
+        raise ValueError(
+            f"--channels={channels} does not match engine manifest channels={input_spec.channels}"
+        )
+    if patch_size != input_spec.patch_size:
+        raise ValueError(
+            f"--patch_size={patch_size} does not match engine manifest patch size "
+            f"{input_spec.patch_size}"
+        )
+    return input_spec
+
+
+def _resolve_cache_paths(out_mask, mask_cache, tiff_cache_dir):
+    output_path = Path(out_mask)
+    if mask_cache == "":
+        raise ValueError("mask_cache must not be an empty path")
+    cache_dir = (
+        Path(tiff_cache_dir)
+        if tiff_cache_dir is not None
+        else output_path.parent / ".cube_nano-cache"
+    )
+    if mask_cache is None:
+        mask_path = cache_dir / f"mask_{os.getpid()}_{uuid4().hex}.dat"
+        owns_mask_cache = True
+    else:
+        mask_path = Path(mask_cache)
+        owns_mask_cache = False
+    if mask_path.exists():
+        raise FileExistsError(f"Mask cache path already exists: {mask_path}")
+    return output_path, cache_dir, mask_path, owns_mask_cache
+
+
+def _disk_allocations_for_shape(shape, output_path, mask_path):
+    mask_bytes = int(shape[0]) * int(shape[1]) * np.dtype(np.uint8).itemsize
+    return (
+        DiskAllocation(output_path, mask_bytes, "atomic output TIFF temporary file"),
+        DiskAllocation(mask_path, mask_bytes, "inference mask cache"),
+    )
+
+
 def process_large_image(
     large_image_path,
     engine_path,
@@ -453,6 +568,22 @@ def process_large_image(
     mask_cache=None,
     cloud_coverage_threshold=0.60,
     discard_cloudy=False,
+    tiff_read_mode="auto",
+    tiff_cache_mode="auto",
+    max_ram_cache_gib=0.5,
+    max_disk_cache_gib=8.0,
+    runtime_reserve_gib=1.5,
+    tiff_block_cache_mib=64,
+    tiff_cache_dir=None,
+    tiff_series=None,
+    tiff_level=None,
+    channel_mapping=None,
+    input_sidecar=None,
+    engine_manifest=None,
+    production_contract=False,
+    _memory_provider=None,
+    _filesystem_provider=None,
+    _trt_infer_factory=None,
 ):
     """
     Xử lý ảnh vệ tinh cực lớn (ví dụ 10000x10000) bằng phương pháp Cửa sổ trượt (Sliding Window)
@@ -476,105 +607,162 @@ def process_large_image(
     if not 0.0 <= cloud_coverage_threshold <= 1.0:
         raise ValueError("cloud_coverage_threshold must be between 0 and 1")
 
-    print(f"Đang đọc metadata ảnh từ {large_image_path}...")
-    H_img, W_img, C_img = _get_image_shape(large_image_path, array_key=array_key)
+    image_path = Path(large_image_path)
+    if production_contract:
+        if engine_manifest is None:
+            raise ValueError("production_contract requires an engine_manifest")
+        if image_path.suffix.lower() in TIFF_EXTENSIONS and input_sidecar is None:
+            raise ValueError("production_contract requires an input_sidecar for TIFF")
 
-    # Khởi tạo TensorRT Engine
+    input_spec = _resolve_input_spec(engine_path, engine_manifest, channels, patch_size)
+    budget = ReaderBudget.from_cli(
+        max_ram_cache_gib=max_ram_cache_gib,
+        max_disk_cache_gib=max_disk_cache_gib,
+        runtime_reserve_gib=runtime_reserve_gib,
+        tiff_block_cache_mib=tiff_block_cache_mib,
+    )
+    output_path, cache_dir, mask_path, owns_mask_cache = _resolve_cache_paths(
+        out_mask,
+        mask_cache,
+        tiff_cache_dir,
+    )
+
+    # Resource guards are evaluated after TensorRT/CUDA allocations.
     print("Khởi tạo TensorRT...")
-    from inference_tensorrt import CloudTRTInfer
+    if _trt_infer_factory is None:
+        from inference_tensorrt import CloudTRTInfer
 
-    trt_infer = CloudTRTInfer(engine_path, channels=channels, patch_size=patch_size, threshold=threshold)
-    
-    # Tính toán số lượng patch
-    num_patches_h = math.ceil(H_img / patch_size)
-    num_patches_w = math.ceil(W_img / patch_size)
-    total_patches = num_patches_h * num_patches_w
-    
-    print(f"Kích thước ảnh: {H_img}x{W_img}x{C_img}")
-    print(f"Tổng số ô {patch_size}x{patch_size} cần xử lý: {total_patches}")
-    
-    # File-backed mask keeps RAM usage independent of the source image size.
-    if mask_cache:
-        cache_path = Path(mask_cache)
+        trt_infer_factory = CloudTRTInfer
     else:
-        cache_fd, cache_name = tempfile.mkstemp(prefix="cloud_mask_", suffix=".dat")
-        os.close(cache_fd)
-        cache_path = Path(cache_name)
-    cloud_mask = np.memmap(cache_path, mode="w+", dtype=np.uint8, shape=(H_img, W_img))
-    cloud_mask[:] = 0
-    
-    start_time = time.time()
-    
-    batch_patches = []
-    batch_coords = []
-    processed_count = 0
-    
-    # Trượt cửa sổ theo từng dải hàng (Row Strip) thay vì load toàn bộ ảnh
-    for row_start in range(0, H_img, patch_size):
-        row_end = min(row_start + patch_size, H_img)
+        trt_infer_factory = _trt_infer_factory
+    trt_infer = trt_infer_factory(
+        engine_path,
+        channels=channels,
+        patch_size=patch_size,
+        threshold=threshold,
+        input_spec=input_spec,
+    )
 
-        # Chỉ đọc dải hàng hiện tại vào RAM
-        strip = _read_image_strip(large_image_path, row_start, row_end, array_key=array_key)
+    filesystem_provider = _filesystem_provider or FilesystemInfoProvider()
+    print(f"Đang đọc metadata ảnh từ {large_image_path}...")
+    if image_path.suffix.lower() in TIFF_EXTENSIONS:
+        reader = TiffReader(
+            image_path,
+            input_spec,
+            read_mode=tiff_read_mode,
+            cache_mode=tiff_cache_mode,
+            budget=budget,
+            cache_dir=cache_dir,
+            series_index=tiff_series,
+            level_index=tiff_level,
+            channel_mapping=channel_mapping,
+            input_sidecar=input_sidecar,
+            patch_size=patch_size,
+            batch_size=batch_size,
+            memory_provider=_memory_provider,
+            filesystem_provider=filesystem_provider,
+            disk_allocations=lambda active_reader: _disk_allocations_for_shape(
+                active_reader.shape,
+                output_path,
+                mask_path,
+            ),
+        )
+    else:
+        reader = _NativeImageReader(image_path, array_key=array_key)
+        allocations = _disk_allocations_for_shape(reader.shape, output_path, mask_path)
+        require_writable_parents(allocations)
+        require_disk_allocations(
+            allocations,
+            provider=filesystem_provider,
+        )
 
-        for j in range(0, W_img, patch_size):
-            j_end = min(j + patch_size, W_img)
-            
-            patch = strip[:, j:j_end, :]
-            patch = _normalize_patch(patch)
-            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
-                patch = _pad_patch(patch, patch_size)
-            patch = np.transpose(patch, (2, 0, 1))
-            
-            # Gộp vào batch
-            batch_patches.append(patch)
-            batch_coords.append((row_start, row_end, j, j_end))
-            
-            # Khi đủ 1 batch hoặc là patch cuối cùng
-            if len(batch_patches) == batch_size or (row_end == H_img and j_end == W_img):
-                # Gộp mảng list thành tensor (B, C, H, W)
-                batch_input = np.stack(batch_patches, axis=0).astype(np.float32)
-                is_cloud_batch, _ = _run_batch(trt_infer, batch_input)
-                
-                # Ghi kết quả vào ảnh mask lớn
-                for idx, (r_start, r_end, c_start, c_end) in enumerate(batch_coords):
-                    if is_cloud_batch[idx]:
-                        cloud_mask[r_start:r_end, c_start:c_end] = 255
-                
-                processed_count += len(batch_patches)
-                if processed_count % 1000 == 0:
-                    print(f"Đã xử lý: {processed_count}/{total_patches} patches...")
-                
-                # Xóa batch để nạp lứa mới
-                batch_patches = []
-                batch_coords = []
+    reader_backend = None
+    reader_metrics = None
+    reader_provenance = None
+    with reader:
+        H_img, W_img, C_img = reader.shape
+        if C_img != input_spec.channels:
+            raise ValueError(
+                f"Image reader outputs {C_img} channels but engine input requires "
+                f"{input_spec.channels}"
+            )
 
-        # strip được giải phóng khi vòng lặp row chuyển sang dải tiếp theo
+        num_patches_h = math.ceil(H_img / patch_size)
+        num_patches_w = math.ceil(W_img / patch_size)
+        total_patches = num_patches_h * num_patches_w
+        print(f"Kích thước ảnh: {H_img}x{W_img}x{C_img}")
+        print(f"Tổng số ô {patch_size}x{patch_size} cần xử lý: {total_patches}")
 
-    end_time = time.time()
-    cloud_coverage = calculate_cloud_coverage(cloud_mask)
-    accepted = is_image_accepted(cloud_mask, cloud_coverage_threshold)
+        start_time = time.time()
+        with _MaskCache(mask_path, (H_img, W_img), owns_mask_cache) as cloud_mask:
+            batch_patches = []
+            batch_coords = []
+            processed_count = 0
 
-    print(f"\nHoàn tất! Tổng thời gian xử lý ảnh {H_img}x{W_img}: {end_time - start_time:.2f} giây")
+            for row_start in range(0, H_img, patch_size):
+                row_end = min(row_start + patch_size, H_img)
+                strip = reader.read_rows(row_start, row_end)
+
+                for column_start in range(0, W_img, patch_size):
+                    column_end = min(column_start + patch_size, W_img)
+                    patch = strip[:, column_start:column_end, :]
+                    patch = input_spec.normalization.apply(patch)
+                    if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
+                        patch = _pad_patch(patch, patch_size)
+                    batch_patches.append(np.transpose(patch, (2, 0, 1)))
+                    batch_coords.append(
+                        (row_start, row_end, column_start, column_end)
+                    )
+
+                    if len(batch_patches) == batch_size or (
+                        row_end == H_img and column_end == W_img
+                    ):
+                        batch_input = np.stack(batch_patches, axis=0)
+                        is_cloud_batch, _ = _run_batch(trt_infer, batch_input)
+                        for index, (r_start, r_end, c_start, c_end) in enumerate(
+                            batch_coords
+                        ):
+                            if is_cloud_batch[index]:
+                                cloud_mask[r_start:r_end, c_start:c_end] = 255
+
+                        processed_count += len(batch_patches)
+                        if processed_count % 1000 == 0:
+                            print(f"Đã xử lý: {processed_count}/{total_patches} patches...")
+                        batch_patches = []
+                        batch_coords = []
+
+            cloud_coverage = calculate_cloud_coverage(cloud_mask)
+            accepted = is_image_accepted(cloud_mask, cloud_coverage_threshold)
+            cloud_mask.flush()
+            _atomic_write_tiff(output_path, cloud_mask)
+
+        elapsed = time.time() - start_time
+        reader_backend = getattr(reader, "backend", "native") or "native"
+        reader_metrics = reader.metrics.as_dict()
+        reader_provenance = dict(getattr(reader, "provenance", {}))
+        reader_provenance["selected_backend"] = reader_backend
+        reader_provenance["source_cache_peak_bytes"] = (
+            int(getattr(reader, "decoded_bytes", 0))
+            if reader_backend == "disk"
+            else 0
+        )
+
+    print(f"\nHoàn tất! Tổng thời gian xử lý ảnh {H_img}x{W_img}: {elapsed:.2f} giây")
     print(
         f"Tỷ lệ vùng bị đánh dấu mây: {cloud_coverage:.2%} "
         f"(ngưỡng loại: {cloud_coverage_threshold:.2%})"
     )
-    cloud_mask.flush()
-    _write_tiff(out_mask, cloud_mask)
-    del cloud_mask
-    if mask_cache is None:
-        os.unlink(cache_path)
 
-    output_mask = str(out_mask)
+    output_mask = str(output_path)
     if not accepted and discard_cloudy:
-        os.remove(out_mask)
+        output_path.unlink()
         output_mask = None
         print("Ảnh bị loại vì tỷ lệ mây đạt ngưỡng; mask đầu ra đã được xóa.")
     elif accepted:
-        print(f"Ảnh được giữ lại; mask mây đã được lưu tại {out_mask}.")
+        print(f"Ảnh được giữ lại; mask mây đã được lưu tại {output_path}.")
     else:
         print(
-            f"Ảnh bị đánh dấu loại; mask vẫn được giữ tại {out_mask}. "
+            f"Ảnh bị đánh dấu loại; mask vẫn được giữ tại {output_path}. "
             "Dùng --discard-cloudy để xóa mask bị loại."
         )
 
@@ -583,6 +771,10 @@ def process_large_image(
         "cloud_coverage": cloud_coverage,
         "cloud_coverage_threshold": cloud_coverage_threshold,
         "out_mask": output_mask,
+        "reader_backend": reader_backend,
+        "reader_metrics": reader_metrics,
+        "reader_provenance": reader_provenance,
+        "elapsed_seconds": elapsed,
     }
 
 if __name__ == '__main__':
@@ -627,7 +819,36 @@ if __name__ == '__main__':
         default=None,
         help="Optional path for the temporary file-backed mask (useful when RAM is limited).",
     )
+    parser.add_argument(
+        "--tiff_read_mode",
+        choices=["auto", "stream", "full"],
+        default="auto",
+    )
+    parser.add_argument(
+        "--tiff_cache_mode",
+        choices=["auto", "ram", "disk"],
+        default="auto",
+    )
+    parser.add_argument("--max_ram_cache_gib", default=None)
+    parser.add_argument("--max_disk_cache_gib", default=None)
+    parser.add_argument("--runtime_reserve_gib", default="1.5")
+    parser.add_argument("--tiff_block_cache_mib", default="64")
+    parser.add_argument("--tiff_cache_dir", type=str, default=None)
+    parser.add_argument("--tiff_series", type=int, default=None)
+    parser.add_argument("--tiff_level", type=int, default=None)
+    parser.add_argument("--channel_mapping", type=str, default=None)
+    parser.add_argument("--input_sidecar", type=str, default=None)
+    parser.add_argument("--engine_manifest", type=str, default=None)
+    parser.add_argument("--production_contract", action="store_true")
     args = parser.parse_args()
+
+    if args.tiff_read_mode == "stream":
+        if args.tiff_cache_mode != "auto":
+            parser.error("--tiff_read_mode=stream requires --tiff_cache_mode=auto")
+        if args.max_ram_cache_gib is not None or args.max_disk_cache_gib is not None:
+            parser.error(
+                "stream mode does not accept explicit decoded-cache size options"
+            )
 
     process_large_image(
         args.image,
@@ -641,4 +862,21 @@ if __name__ == '__main__':
         mask_cache=args.mask_cache,
         cloud_coverage_threshold=args.cloud_coverage_threshold,
         discard_cloudy=args.discard_cloudy,
+        tiff_read_mode=args.tiff_read_mode,
+        tiff_cache_mode=args.tiff_cache_mode,
+        max_ram_cache_gib=(
+            "0.5" if args.max_ram_cache_gib is None else args.max_ram_cache_gib
+        ),
+        max_disk_cache_gib=(
+            "8.0" if args.max_disk_cache_gib is None else args.max_disk_cache_gib
+        ),
+        runtime_reserve_gib=args.runtime_reserve_gib,
+        tiff_block_cache_mib=args.tiff_block_cache_mib,
+        tiff_cache_dir=args.tiff_cache_dir,
+        tiff_series=args.tiff_series,
+        tiff_level=args.tiff_level,
+        channel_mapping=args.channel_mapping,
+        input_sidecar=args.input_sidecar,
+        engine_manifest=args.engine_manifest,
+        production_contract=args.production_contract,
     )

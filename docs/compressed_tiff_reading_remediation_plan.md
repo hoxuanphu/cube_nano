@@ -1,5 +1,8 @@
 # Phuong an xu ly TIFF nen khi inference anh lon
 
+Trang thai implementation va cac exit gate con lai duoc theo doi tai
+`docs/compressed_tiff_implementation_status.md`.
+
 ## 1. Van de, muc tieu va pham vi
 
 Trong `src/inference_large_image_trt.py`, `process_large_image()` doc tung row strip qua `_read_image_strip()`. Khi `tifffile.memmap()` that bai, fallback hien tai goi `tiff.imread()` cho moi row strip va co the giai ma toan bo anh lap lai nhieu lan.
@@ -396,7 +399,13 @@ Path policy:
 --tiff_level <non-negative-index>              default: none; auto 0 only when unique
 --channel_mapping <mapping>                    default: none
 --input_sidecar <path>                         default: none
+--engine_manifest <path>                       default: none
+--production_contract                          default: false
 ```
+
+`production_contract` bat buoc ca `engine_manifest` va `input_sidecar` cho TIFF.
+Che do compatibility co the dung legacy fixed normalization khi manifest khong duoc
+cung cap, nhung van phai qua binding, metadata va resource validation.
 
 Interaction contract:
 

@@ -81,14 +81,19 @@ def parse_channel_mapping(value):
 
 def _fingerprint_digest(payload, label):
     if isinstance(payload, str):
-        return payload.lower()
-    if not isinstance(payload, dict):
-        raise ValueError(f"{label} must be a SHA-256 object")
-    if str(payload.get("algorithm", "")).lower() != "sha256":
-        raise ValueError(f"{label}.algorithm must be 'sha256'")
-    digest = payload.get("digest")
+        digest = payload
+    else:
+        if not isinstance(payload, dict):
+            raise ValueError(f"{label} must be a SHA-256 object")
+        if str(payload.get("algorithm", "")).lower() != "sha256":
+            raise ValueError(f"{label}.algorithm must be 'sha256'")
+        digest = payload.get("digest")
     if not isinstance(digest, str) or len(digest) != 64:
         raise ValueError(f"{label}.digest must be a 64-character SHA-256 digest")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise ValueError(f"{label}.digest must contain hexadecimal characters") from exc
     return digest.lower()
 
 
@@ -143,9 +148,12 @@ def load_input_sidecar(path, source_path, verify_fingerprint=True):
     if unsupported:
         raise ValueError(f"Unsupported sidecar band roles: {sorted(unsupported)}")
 
+    raw_dtype = payload.get("dtype")
+    if raw_dtype is None:
+        raise ValueError("input sidecar dtype is required")
     try:
-        dtype = np.dtype(payload.get("dtype"))
-    except TypeError as exc:
+        dtype = np.dtype(raw_dtype)
+    except (TypeError, ValueError) as exc:
         raise ValueError("input sidecar dtype is invalid") from exc
 
     input_spec_id = payload.get("input_spec_id")
@@ -287,6 +295,7 @@ class EngineInputSpec:
     normalization: NormalizationSpec
     input_shape: tuple
     input_dtype: np.dtype
+    optimization_profile: dict
     engine_digest: str | None = None
     manifest_path: Path | None = None
 
@@ -322,6 +331,33 @@ def load_engine_manifest(path, engine_path=None, verify_fingerprint=True):
     if any(value <= 0 for value in input_shape):
         raise ValueError("engine manifest input_shape must be fixed and positive")
 
+    raw_profile = payload.get("optimization_profile")
+    if not isinstance(raw_profile, dict):
+        raise ValueError("engine manifest optimization_profile must be an object")
+    optimization_profile = {}
+    for key in ("min", "opt", "max"):
+        raw_profile_shape = raw_profile.get(key)
+        if not isinstance(raw_profile_shape, list) or len(raw_profile_shape) != 4:
+            raise ValueError(f"optimization_profile.{key} must be a four-value shape")
+        try:
+            profile_shape = tuple(int(value) for value in raw_profile_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"optimization_profile.{key} values must be integers"
+            ) from exc
+        if any(value <= 0 for value in profile_shape):
+            raise ValueError(f"optimization_profile.{key} values must be positive")
+        optimization_profile[key] = profile_shape
+    if optimization_profile["opt"] != input_shape:
+        raise ValueError("optimization_profile.opt must match engine manifest input_shape")
+    for minimum, optimum, maximum in zip(
+        optimization_profile["min"],
+        optimization_profile["opt"],
+        optimization_profile["max"],
+    ):
+        if not minimum <= optimum <= maximum:
+            raise ValueError("optimization profile must satisfy min <= opt <= max")
+
     raw_band_order = input_spec_payload.get("band_order")
     if not isinstance(raw_band_order, list):
         raise ValueError("engine manifest band_order must be a list")
@@ -353,9 +389,12 @@ def load_engine_manifest(path, engine_path=None, verify_fingerprint=True):
         if not hmac.compare_digest(engine_digest, actual_digest):
             raise ValueError("engine manifest fingerprint does not match the TensorRT engine")
 
+    raw_input_dtype = payload.get("input_dtype", input_spec_payload.get("input_dtype"))
+    if raw_input_dtype is None:
+        raise ValueError("engine manifest input_dtype is required")
     try:
-        input_dtype = np.dtype(payload.get("input_dtype", input_spec_payload.get("input_dtype")))
-    except TypeError as exc:
+        input_dtype = np.dtype(raw_input_dtype)
+    except (TypeError, ValueError) as exc:
         raise ValueError("engine manifest input_dtype is invalid") from exc
 
     normalization = NormalizationSpec.from_value(
@@ -369,6 +408,7 @@ def load_engine_manifest(path, engine_path=None, verify_fingerprint=True):
         normalization=normalization,
         input_shape=input_shape,
         input_dtype=input_dtype,
+        optimization_profile=optimization_profile,
         engine_digest=engine_digest,
         manifest_path=Path(path),
     )
@@ -389,4 +429,9 @@ def legacy_input_spec(channels, patch_size, input_dtype=np.float32):
         normalization=normalization,
         input_shape=(1, channels, patch_size, patch_size),
         input_dtype=np.dtype(input_dtype),
+        optimization_profile={
+            "min": (1, channels, patch_size, patch_size),
+            "opt": (1, channels, patch_size, patch_size),
+            "max": (1, channels, patch_size, patch_size),
+        },
     )

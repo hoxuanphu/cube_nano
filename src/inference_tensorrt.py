@@ -9,7 +9,14 @@ import time
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 class CloudTRTInfer:
-    def __init__(self, engine_path, channels=4, patch_size=256, threshold=0.5):
+    def __init__(
+        self,
+        engine_path,
+        channels=4,
+        patch_size=256,
+        threshold=0.5,
+        input_spec=None,
+    ):
         """
         Khởi tạo bộ suy luận TensorRT từ file .engine
 
@@ -20,11 +27,11 @@ class CloudTRTInfer:
             threshold: Probability threshold for cloud classification (default 0.5).
         """
         self.engine_path = engine_path
-        self.channels = channels
-        self.patch_size = patch_size
         self.threshold = threshold
         self.runtime = trt.Runtime(TRT_LOGGER)
         self.engine = self.load_engine()
+        self.input_spec = input_spec
+        self._resolve_input_contract(channels, patch_size)
         self.context = self.engine.create_execution_context()
         
         # Cấp phát bộ nhớ (Memory Allocation)
@@ -37,6 +44,57 @@ class CloudTRTInfer:
         print(f"Đang nạp TensorRT Engine: {self.engine_path}")
         with open(self.engine_path, "rb") as f:
             return self.runtime.deserialize_cuda_engine(f.read())
+
+    def _resolve_input_contract(self, channels, patch_size):
+        input_bindings = [
+            binding for binding in self.engine if self.engine.binding_is_input(binding)
+        ]
+        if len(input_bindings) != 1:
+            raise ValueError(
+                f"Expected exactly one TensorRT input binding, found {len(input_bindings)}"
+            )
+
+        binding = input_bindings[0]
+        shape = tuple(int(value) for value in self.engine.get_binding_shape(binding))
+        if len(shape) != 4 or any(value <= 0 for value in shape):
+            raise ValueError(f"TensorRT input binding must have fixed NCHW shape, got {shape}")
+        if shape[2] != shape[3]:
+            raise ValueError(f"TensorRT input binding must use square patches, got {shape[2:]}")
+
+        binding_dtype = np.dtype(trt.nptype(self.engine.get_binding_dtype(binding)))
+        if channels is not None and int(channels) != shape[1]:
+            raise ValueError(
+                f"Configured channels={channels} do not match TensorRT binding channels={shape[1]}"
+            )
+        if patch_size is not None and int(patch_size) != shape[2]:
+            raise ValueError(
+                f"Configured patch_size={patch_size} does not match TensorRT binding size={shape[2]}"
+            )
+        if self.input_spec is not None:
+            manifest_backed = self.input_spec.manifest_path is not None
+            expected_shape = tuple(self.input_spec.input_shape)
+            shape_matches = (
+                expected_shape == shape
+                if manifest_backed
+                else expected_shape[1:] == shape[1:]
+            )
+            if not shape_matches:
+                raise ValueError(
+                    f"Input contract shape {self.input_spec.input_shape} does not match "
+                    f"TensorRT binding shape {shape}"
+                )
+            if np.dtype(self.input_spec.input_dtype) != binding_dtype:
+                raise ValueError(
+                    f"Input contract dtype {self.input_spec.input_dtype} does not match "
+                    f"TensorRT binding dtype {binding_dtype}"
+                )
+
+        self.input_binding = binding
+        self.input_shape = shape
+        self.input_dtype = binding_dtype
+        self.engine_batch_size = shape[0]
+        self.channels = shape[1]
+        self.patch_size = shape[2]
 
     def allocate_buffers(self):
         inputs = []
@@ -69,24 +127,17 @@ class CloudTRTInfer:
         return inputs, outputs, bindings, stream
 
     def _prepare_input(self, img_patch):
-        img_patch = np.asarray(img_patch, dtype=np.float32)
+        img_patch = np.asarray(img_patch, dtype=self.input_dtype)
         if img_patch.ndim != 4:
             raise ValueError(f"Expected input shape (B, C, H, W), got {img_patch.shape}")
         if img_patch.shape[2:] != (self.patch_size, self.patch_size):
             raise ValueError(
                 f"Expected spatial shape ({self.patch_size}, {self.patch_size}), got {img_patch.shape[2:]}"
             )
-        if img_patch.shape[1] not in (3, 4):
-            raise ValueError(f"Expected 3 or 4 input channels, got {img_patch.shape[1]}")
-
-        if img_patch.shape[1] < self.channels:
-            pad = np.zeros(
-                (img_patch.shape[0], self.channels - img_patch.shape[1], self.patch_size, self.patch_size),
-                dtype=np.float32,
+        if img_patch.shape[1] != self.channels:
+            raise ValueError(
+                f"Expected exactly {self.channels} input channels, got {img_patch.shape[1]}"
             )
-            img_patch = np.concatenate([img_patch, pad], axis=1)
-        elif img_patch.shape[1] > self.channels:
-            img_patch = img_patch[:, :self.channels, :, :]
 
         return np.ascontiguousarray(img_patch)
 

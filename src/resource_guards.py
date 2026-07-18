@@ -171,6 +171,24 @@ class DiskAllocation:
             raise ValueError("Disk allocation bytes must be non-negative")
 
 
+def require_writable_parents(allocations):
+    checked = set()
+    for allocation in allocations:
+        candidate = Path(allocation.path).expanduser().resolve(strict=False)
+        parent = candidate if candidate.is_dir() else candidate.parent
+        while not parent.exists():
+            if parent == parent.parent:
+                raise FileNotFoundError(f"No existing parent for path {allocation.path}")
+            parent = parent.parent
+        if parent in checked:
+            continue
+        checked.add(parent)
+        if not os.access(parent, os.W_OK):
+            raise PermissionError(
+                f"Directory is not writable for {allocation.purpose}: {parent}"
+            )
+
+
 def require_disk_allocations(
     allocations,
     provider=None,
