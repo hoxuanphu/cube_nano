@@ -15,6 +15,11 @@ data/ground/products/*
 htmlcov/
 .cube_nano-cache/
 
+# GDS web generated dependencies and browser test output
+gds/web/node_modules/
+gds/web/artifacts/
+gds/web/test-results/
+
 # Virtual environments
 .venv/
 venv/
