@@ -1,0 +1,35 @@
+schema_version: 1
+profile_id: compose_sil
+topology: compose_sil
+bind_host: 0.0.0.0
+allowed_peers: [127.0.0.1, gds]
+allowed_origins: [http://127.0.0.1, http://127.0.0.1:4173, http://127.0.0.1:8000]
+network_exposure: false
+sqlite:
+  journal_mode: WAL
+  synchronous: FULL
+  foreign_keys: true
+  busy_timeout_ms: 5000
+  wal_autocheckpoint_pages: 1000
+  wal_warning_bytes: 134217728
+  wal_throttle_bytes: 268435456
+  max_reader_seconds: 2
+  single_writer: true
+  writer_queue_capacity: 4096
+  high_priority_reserve: 256
+storage:
+  ground_cap_bytes: 21474836480
+  low_watermark_percent: 80
+  hard_watermark_percent: 90
+  emergency_reserve_bytes: 268435456
+  replay_retention_days: 30
+replay:
+  schema: link-replay-v1
+  state_values: [PRESENT, PINNED, EVICTED]
+  deterministic_fault_algorithm: counter-prf-sha256-v1
+limits:
+  request_body_bytes: 1048576
+  header_bytes: 16384
+  requests_per_minute: 120
+  download_bytes: 1073741824
+  extract_bytes: 2147483648

@@ -9,3 +9,4 @@ h5py
 pyhdf
 netCDF4
 wandb
+PyYAML

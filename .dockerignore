@@ -1,0 +1,13 @@
+.git
+.codex
+.claude
+.pytest_cache
+__pycache__
+*.pyc
+src/data/T48PYS_RGB.tif
+src/data/T48PYS_*.jp2
+data/ground
+data/satellite/products
+data/satellite/state
+gds/web/node_modules
+gds/web/dist

@@ -1,0 +1,77 @@
+services:
+  gds:
+    image: cube-nano-gds:cpu
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.cpu
+    command: ["python", "-m", "gds.http_app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - mission_internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    volumes:
+      - ground_state:/app/.cube_nano-cache
+    depends_on:
+      link:
+        # Link readiness proves a GDS/satellite exchange, so GDS must be
+        # allowed to start before that exchange exists.
+        condition: service_started
+      satellite:
+        condition: service_started
+    environment:
+      CUBE_NANO_LINK_MODE: udp
+      CUBE_NANO_LINK_HOST: link
+      CUBE_NANO_LINK_PORT: "9000"
+      CUBE_NANO_GDS_UDP_PORT: "9001"
+      CUBE_NANO_LINK_SESSION_ID: "1"
+      CUBE_NANO_LINK_GENERATION: "1"
+      CUBE_NANO_SIMULATION_RUN_ID: "42"
+
+  link:
+    image: cube-nano-gds:cpu
+    command: ["python", "-m", "link_sim", "--serve", "--bind-host", "0.0.0.0", "--bind-port", "9000", "--gds-host", "gds", "--gds-port", "9001", "--satellite-host", "satellite", "--satellite-port", "9002", "--spacecraft-instance-id", "1", "--state-directory", "/app/data/link", "--fault-profile", "/app/deploy/fault_profiles/lossless.yaml", "--seed", "42", "--run-id", "42"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "link_sim", "--health-once", "--health-host", "127.0.0.1", "--health-port", "9000"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    expose:
+      - "9000/udp"
+    networks:
+      - mission_internal
+    volumes:
+      - link_state:/app/data/link
+
+  satellite:
+    image: cube-nano-gds:cpu
+    command: ["python", "-m", "flight.satellite_simulator", "--udp", "--udp-bind-host", "0.0.0.0", "--udp-bind-port", "9002", "--link-host", "link", "--link-port", "9000", "--link-session-id", "1"]
+    expose:
+      - "9002/udp"
+    networks:
+      - mission_internal
+    volumes:
+      # Keep journal boot ID and TM/APID-3 counters across container restart.
+      # Mount only mutable subtrees so the immutable scene catalog in the
+      # image remains visible at /app/data/satellite/scenes.
+      - satellite_state:/app/data/satellite/state
+      - satellite_products:/app/data/satellite/products
+    environment:
+      CUBE_NANO_LINK_MODE: udp
+      CUBE_NANO_LINK_HOST: link
+      CUBE_NANO_LINK_PORT: "9000"
+      CUBE_NANO_LINK_SESSION_ID: "1"
+      CUBE_NANO_LINK_GENERATION: "1"
+      CUBE_NANO_SIMULATION_RUN_ID: "42"
+
+networks:
+  mission_internal:
+    internal: true
+
+volumes:
+  ground_state:
+  satellite_state:
+  satellite_products:
+  link_state:
