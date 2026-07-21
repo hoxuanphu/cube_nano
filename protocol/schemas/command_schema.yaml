@@ -1,0 +1,33 @@
+schema_version: 1
+byte_order: big
+u64_json: lowercase_16_hex
+request_key:
+  ground_instance_id: U64
+  request_id: U32
+scene_ref:
+  catalog_epoch: U32
+  scene_id: U32
+  scene_revision: U32
+product_ref:
+  spacecraft_instance_id: U64
+  origin_boot_id: U32
+  product_id: U32
+commands:
+  - name: CLOUD_SET_CONFIG
+    opcode: 65537
+  - name: SCENE_REQUEST_CATALOG
+    opcode: 65538
+  - name: SCENE_REQUEST_PREVIEW
+    opcode: 65539
+  - name: SCENE_ANALYZE
+    opcode: 65540
+  - name: ROI_REQUEST
+    opcode: 65541
+  - name: JOB_GET_STATUS
+    opcode: 65542
+  - name: JOB_CANCEL
+    opcode: 65543
+  - name: PRODUCT_REQUEST_DOWNLINK
+    opcode: 65544
+  - name: PRODUCT_CANCEL_DOWNLINK
+    opcode: 65545
