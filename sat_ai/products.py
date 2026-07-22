@@ -248,6 +248,15 @@ def build_products(
     mask = np.asarray(result["cloud_mask"], dtype=np.uint8)
     if mask.shape != (roi.height, roi.width):
         raise ValueError("inference cloud_mask shape does not match ROI")
+    validity = result.get("validity_mask")
+    if validity is not None:
+        validity = np.asarray(validity, dtype=np.uint8)
+        if validity.shape != (roi.height, roi.width):
+            raise ValueError("inference validity_mask shape does not match ROI")
+        if not np.isin(np.unique(validity), (0, 1)).all():
+            raise ValueError("inference validity_mask must contain only 0/1")
+        if np.any((validity == 0) & (mask != 0)):
+            raise ValueError("cloud_mask must be clear where validity_mask is invalid")
     root = Path(output_directory)
     product_directory = root / f"{product_ref.origin_boot_id:08x}" / f"{product_ref.product_id:08x}"
     product_directory.parent.mkdir(parents=True, exist_ok=True)
@@ -268,6 +277,10 @@ def build_products(
             "quicklook.webp": quicklook_path,
             "cloud_mask.tif": mask_path,
         }
+        if validity is not None:
+            validity_path = staging / "validity_mask.tif"
+            _write_tiff(validity_path, validity, "YX")
+            artifact_paths["validity_mask.tif"] = validity_path
         if result["science_decision"] == "ACCEPTED":
             crop_path = staging / "crop.tif"
             _write_tiff(crop_path, source_crop, "YXC")
@@ -290,6 +303,7 @@ def build_products(
             "coverage_algorithm_id": result["coverage_algorithm_id"],
             "validity_algorithm_id": result["validity_algorithm_id"],
             "padding_algorithm_id": result["padding_algorithm_id"],
+            "model_task": result.get("model_task", "patch_classification"),
             "model_release_id": result["model_release_id"],
             "model_sha256": result["model_sha256"],
             "assurance_level": result["science_status"],
@@ -299,7 +313,6 @@ def build_products(
             "threshold_lut_sha256": result["threshold_lut_sha256"],
             "model_threshold_bp": result["model_threshold_bp"],
             "coverage_limit_bp": result["coverage_limit_bp"],
-            "cloud_positive_tile_area_ratio_bp": result["cloud_positive_tile_area_ratio_bp"],
             "science_decision": result["science_decision"],
             "display_profile": {
                 "id": display_profile.profile_id,
@@ -310,6 +323,20 @@ def build_products(
             },
             "artifacts": artifact_list,
         }
+        if result.get("cloud_positive_tile_area_ratio_bp") is not None:
+            manifest["cloud_positive_tile_area_ratio_bp"] = result["cloud_positive_tile_area_ratio_bp"]
+        for key in (
+            "pixel_cloud_ratio_bp",
+            "valid_pixel_ratio_bp",
+            "decision_spec_id",
+            "postprocess_id",
+            "product_spec_id",
+            "acceptance_profile_id",
+            "target_id",
+            "deployment_profile_id",
+        ):
+            if key in result:
+                manifest[key] = result[key]
         manifest_bytes = canonical_json(manifest) + b"\n"
         _atomic_write(staging / "manifest.json", manifest_bytes)
         bundle_size, bundle_sha256 = write_ustar(

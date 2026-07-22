@@ -8,12 +8,28 @@ from pathlib import Path
 import torch
 
 from src.models.mobilenetv3 import get_cloud_model
+from src.models.segformer_b0 import get_segformer_b0
 
 
-def load_model(model_path: str | Path, channels: int, device: torch.device, *, allow_untrained: bool = False):
+def _model_for_task(model_task: str, channels: int):
+    if model_task == "patch_classification":
+        return get_cloud_model(pretrained=False, num_channels=channels)
+    if model_task == "semantic_cloud_segmentation":
+        return get_segformer_b0(pretrained=False, num_classes=2, num_channels=channels)
+    raise ValueError(f"unsupported model task: {model_task}")
+
+
+def load_model(
+    model_path: str | Path,
+    channels: int,
+    device: torch.device,
+    *,
+    allow_untrained: bool = False,
+    model_task: str = "patch_classification",
+):
     if channels != 3:
         raise ValueError("production model runtime accepts exactly 3 RGB channels")
-    model = get_cloud_model(pretrained=False, num_channels=channels)
+    model = _model_for_task(model_task, channels)
     path = Path(model_path)
     if path.is_file():
         checkpoint = torch.load(path, map_location=device)

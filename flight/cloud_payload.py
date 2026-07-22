@@ -108,6 +108,7 @@ class CloudPayload:
                 on_result=self._handle_worker_result,
                 on_started=self._handle_worker_started,
                 on_state_change=self.deployment.set_worker_state,
+                deployment_profile_path=self.deployment.deployment_profile_path,
             )
             try:
                 self.worker_client.start()
@@ -141,7 +142,15 @@ class CloudPayload:
             "queue_capacity": worker_health["queue_capacity"],
             "config": self.journal.current_config().as_dict(),
             "model_release_id": self.manifest.model_release_id,
+            "model_task": self.manifest.model_task,
             "model_sha256": self.manifest.checkpoint_sha256,
+            "model_contracts": {
+                "input_spec_id": self.manifest.input_spec.input_spec_id,
+                "decision_spec_id": None if self.manifest.decision_spec is None else self.manifest.decision_spec.decision_spec_id,
+                "postprocess_id": None if self.manifest.postprocess_spec is None else self.manifest.postprocess_spec.postprocess_id,
+                "product_spec_id": None if self.manifest.product_spec is None else self.manifest.product_spec.product_spec_id,
+                "acceptance_profile_id": self.manifest.acceptance_profile_id,
+            },
             "assurance_level": self.manifest.assurance_level,
             "catalog_epoch": self.catalog.epoch,
             "catalog_revision": self.catalog.revision,
@@ -280,6 +289,15 @@ class CloudPayload:
 
     def _handle_set_config(self, command: Command, digest: str) -> dict[str, Any]:
         payload = command.payload
+        if (
+            self.manifest.model_task == "semantic_cloud_segmentation"
+            and self.manifest.decision_spec is not None
+            and not self.manifest.decision_spec.matches_config(
+                int(payload["model_threshold_bp"]),
+                int(payload["coverage_limit_bp"]),
+            )
+        ):
+            return self._record_rejection(command, digest, "DECISION_SPEC_MISMATCH")
         snapshot, result = self.journal.apply_config_command(
             command.request_key,
             int(command.opcode),
@@ -305,6 +323,15 @@ class CloudPayload:
             raise ValueError("CONFIG_REVISION_MISMATCH")
         if current.model_threshold_bp != expected.model_threshold_bp or current.coverage_limit_bp != expected.coverage_limit_bp:
             raise ValueError("CONFIG_SNAPSHOT_MISMATCH")
+        if (
+            self.manifest.model_task == "semantic_cloud_segmentation"
+            and self.manifest.decision_spec is not None
+            and not self.manifest.decision_spec.matches_config(
+                current.model_threshold_bp,
+                current.coverage_limit_bp,
+            )
+        ):
+            raise ValueError("DECISION_SPEC_MISMATCH")
         return current
 
     def _job_deadline_ms(self, scene_shape: tuple[int, int, int], roi: ROI) -> tuple[int, int]:
@@ -336,6 +363,7 @@ class CloudPayload:
         patch_count, deadline_ms = self._job_deadline_ms(scene.shape, roi)
         deadline = DeadlineContract.after_ms(deadline_ms)
         immutable_snapshot = {
+            "model_task": self.manifest.model_task,
             "model_release_id": self.manifest.model_release_id,
             "model_sha256": self.manifest.checkpoint_sha256,
             "input_spec_id": self.manifest.input_spec.input_spec_id,
@@ -343,6 +371,12 @@ class CloudPayload:
             "domain_status": domain_status,
             "threshold_mapping_id": self.lut.lut_id,
             "threshold_lut_sha256": self.lut.sha256,
+            "decision_spec_id": None if self.manifest.decision_spec is None else self.manifest.decision_spec.decision_spec_id,
+            "postprocess_id": None if self.manifest.postprocess_spec is None else self.manifest.postprocess_spec.postprocess_id,
+            "product_spec_id": None if self.manifest.product_spec is None else self.manifest.product_spec.product_spec_id,
+            "acceptance_profile_id": self.manifest.acceptance_profile_id,
+            "target_id": self.deployment.deployment_profile.get("target_id"),
+            "deployment_profile_id": self.deployment.deployment_profile.get("profile_id"),
             "config_snapshot": snapshot.as_dict(),
             "scene_ref": scene_ref.as_dict(),
             "roi": roi.as_dict(),

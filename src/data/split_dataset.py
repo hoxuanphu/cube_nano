@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import random
 import shutil
@@ -61,7 +62,54 @@ def validate_image_mask_pairs(src_dir, scene_files):
             "Source image/mask pairing failed: "
             f"missing_masks={missing_masks[:5]}, orphan_masks={orphan_masks[:5]}"
         )
-    return mask_paths
+    validity_dir = src_dir / "validity"
+    validity_paths = None
+    if validity_dir.is_dir():
+        validity_paths = {path.name: path for path in validity_dir.glob("*.npy")}
+        validity_names = set(validity_paths)
+        missing_validity = sorted(image_names - validity_names)
+        orphan_validity = sorted(validity_names - image_names)
+        if missing_validity or orphan_validity:
+            raise ValueError(
+                "Source image/validity pairing failed: "
+                f"missing_validity={missing_validity[:5]}, orphan_validity={orphan_validity[:5]}"
+            )
+    raw_mask_dir = src_dir / "raw_masks"
+    raw_mask_paths = None if not raw_mask_dir.is_dir() else {
+        path.name: path for path in raw_mask_dir.glob("*.npy")
+    }
+    if raw_mask_paths is not None:
+        raw_names = set(raw_mask_paths)
+        missing_raw = sorted(image_names - raw_names)
+        orphan_raw = sorted(raw_names - image_names)
+        if missing_raw or orphan_raw:
+            raise ValueError(
+                "Source image/raw-ground-truth pairing failed: "
+                f"missing_raw={missing_raw[:5]}, orphan_raw={orphan_raw[:5]}"
+            )
+    return mask_paths, validity_paths, raw_mask_paths
+
+
+def scene_split_lineage_id(
+    src_dir: str | Path,
+    scene_splits: dict[str, list[str]],
+    *,
+    preprocessing_config: dict | None = None,
+) -> str:
+    """Hash source files, scene assignment and preprocessing config deterministically."""
+
+    src_dir = Path(src_dir)
+    files = []
+    for path in sorted(src_dir.rglob("*.npy")):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        files.append({"path": str(path.relative_to(src_dir)).replace("\\", "/"), "sha256": digest})
+    payload = {
+        "schema_version": 1,
+        "files": files,
+        "scene_splits": {key: sorted(value) for key, value in sorted(scene_splits.items())},
+        "preprocessing_config": preprocessing_config or {},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def split_scenes(scene_ids, val_ratio, test_ratio, seed):
@@ -114,8 +162,13 @@ def main():
 
     # Check for existing files in output directories
     existing_files = []
+    source_subdirs = ["cloud", "clear", "masks"]
+    if (src_root / "validity").is_dir():
+        source_subdirs.append("validity")
+    if (src_root / "raw_masks").is_dir():
+        source_subdirs.append("raw_masks")
     for split in ("train", "val", "test"):
-        for class_name in ("cloud", "clear", "masks"):
+        for class_name in source_subdirs:
             split_dir = Path(args.out_dir, split, class_name)
             if split_dir.exists():
                 existing_files.extend(split_dir.glob("*.npy"))
@@ -129,7 +182,7 @@ def main():
     scene_files = collect_scene_files(src_root)
     if not scene_files:
         raise ValueError(f"No processed patches found under {src_root}")
-    mask_paths = validate_image_mask_pairs(src_root, scene_files)
+    mask_paths, validity_paths, raw_mask_paths = validate_image_mask_pairs(src_root, scene_files)
 
     print(f"Found {len(scene_files)} scenes.")
 
@@ -146,7 +199,7 @@ def main():
 
     # Create output directories (clear old files if --force)
     for split in scene_splits:
-        for class_name in ("cloud", "clear", "masks"):
+        for class_name in source_subdirs:
             out_dir = Path(args.out_dir, split, class_name)
             out_dir.mkdir(parents=True, exist_ok=True)
             if args.force:
@@ -166,6 +219,16 @@ def main():
                     mask_src = mask_paths[src_path.name]
                     mask_dest = Path(args.out_dir, split, "masks", src_path.name)
                     operation(str(mask_src), str(mask_dest))
+                    if validity_paths is not None:
+                        operation(
+                            str(validity_paths[src_path.name]),
+                            str(Path(args.out_dir, split, "validity", src_path.name)),
+                        )
+                    if raw_mask_paths is not None:
+                        operation(
+                            str(raw_mask_paths[src_path.name]),
+                            str(Path(args.out_dir, split, "raw_masks", src_path.name)),
+                        )
                     counts[label] += 1
                     mask_count += 1
         image_count = counts["cloud"] + counts["clear"]
@@ -182,10 +245,33 @@ def main():
             f"cloud={counts['cloud']}, clear={counts['clear']}, masks={mask_count}"
         )
 
+    lineage_id = scene_split_lineage_id(
+        src_root,
+        scene_splits,
+        preprocessing_config={
+            "patch_size": "source-manifest-defined",
+            "validity": "separate-mask-or-all-valid",
+            "seed": args.seed,
+        },
+    )
+    for details in manifest.values():
+        details["lineage_id"] = lineage_id
+        details["validity_artifact"] = validity_paths is not None
+        details["raw_ground_truth_artifact"] = raw_mask_paths is not None
+    lineage_manifest = {
+        "schema_version": 1,
+        "lineage_id": lineage_id,
+        "source_directory": str(src_root.resolve()),
+        "scene_splits": scene_splits,
+        "validity_artifact": validity_paths is not None,
+        "raw_ground_truth_artifact": raw_mask_paths is not None,
+    }
     # Save manifest
     manifest_path = Path(args.out_dir, "scene_split_manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
+    with open(Path(args.out_dir, "scene_split_lineage.json"), "w") as f:
+        json.dump(lineage_manifest, f, indent=2, sort_keys=True)
     print(f"\nScene split manifest saved: {manifest_path}")
     print("Dataset split completed (scene-level).")
 

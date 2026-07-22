@@ -1,0 +1,23 @@
+schema_version: 1
+profile_id: cloud-segformer-b0-rgb-local-cpu-v1
+model_task: semantic_cloud_segmentation
+model_manifest_path: sat_ai/segformer_model_manifest.yaml
+checkpoint_path: checkpoints/segformer_b0_rgb_r1.pth
+acceptance_profile_path: sat_ai/acceptance_profile.yaml
+target_deployment_spec_path: sat_ai/target_deployment_spec.yaml
+target_id: local-cpu-reference-v1
+runtime: pytorch
+runtime_version: "2.13.0+cpu"
+cpu_threads: 1
+deployable: false
+ready: false
+blocked_reason: trained checkpoint, parity report and target benchmark are not present
+benchmark_artifact_id: null
+benchmark_artifact_sha256: null
+batch_size: 1
+max_batch_size: 1
+progress_min_delta_bp: 100
+progress_min_interval_ms: 1000
+progress_max_silence_ms: 5000
+max_window_rss_delta_bytes: 1073741824
+scene_scale_p95_ratio: 1.25

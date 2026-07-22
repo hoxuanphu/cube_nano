@@ -8,7 +8,7 @@
     "protocol/golden_vectors/vectors.json": "ac13cff34e6b2fbe487cc2a6f20eb9bfcfaff07184471a06498d75b0c7e2be3b",
     "protocol/golden_vectors/threshold_lut.bin": "e4ffc71acb49767c62658b880e1f135d0ce2b0f29ac6b8915d6d16e63111b38c",
     "sat_ai/model_manifest.yaml": "d8554821d159585d66e0cd5120be9e763bbeef6c230b39e5992cc14beeecf9de",
-    "sat_ai/deployment_profile.yaml": "f09bcae5a2186534e3dc34ce76a26468ff9ec795d0b60b853ddd7b6ab401b30f",
-    "artifacts/benchmarks/local-cpu-pytorch-v2.json": "e5937eb6def458ffbe12f3be7479c91e24e77e713888bd79adbbf0805722deaf"
+    "sat_ai/deployment_profile.yaml": "2731ec857822aebd5347d4619e7a59b1f07b7cfee0f2a05de04f111bf684adb1",
+    "artifacts/benchmarks/local-cpu-pytorch-v2.json": "91194d9a78b84115b1931156fbc3d3a79375b60052394103d4c9c0a14fa71b2a"
   }
 }

@@ -92,6 +92,13 @@ def _create_fixture(directory: Path, name: str, shape: tuple[int, int, int], inp
     return source_path, sidecar_path
 
 
+def _load_active_profile(root: Path) -> tuple[dict, Path, Path]:
+    profile = yaml.safe_load((root / "sat_ai" / "deployment_profile.yaml").read_text(encoding="utf-8"))
+    manifest_path = root / str(profile.get("model_manifest_path", "sat_ai/model_manifest.yaml"))
+    checkpoint_path = root / str(profile.get("checkpoint_path", "checkpoints/best_model.pth"))
+    return profile, manifest_path, checkpoint_path
+
+
 def _measure_scene(
     source_path: Path,
     sidecar_path: Path,
@@ -115,13 +122,11 @@ def _measure_scene(
 
 def run_benchmark(root: str | Path) -> dict:
     root = Path(root)
-    deployment_profile = yaml.safe_load(
-        (root / "sat_ai" / "deployment_profile.yaml").read_text(encoding="utf-8")
-    )
+    deployment_profile, manifest_path, checkpoint_path = _load_active_profile(root)
     configure_cpu_runtime(int(deployment_profile["cpu_threads"]))
     manifest = load_model_manifest(
-        root / "sat_ai" / "model_manifest.yaml",
-        root / "checkpoints" / "best_model.pth",
+        manifest_path,
+        checkpoint_path,
     )
     lut = ThresholdLUT.from_file(
         root / "protocol" / "golden_vectors" / "threshold_lut.bin",
@@ -139,7 +144,7 @@ def run_benchmark(root: str | Path) -> dict:
         load_started = time.perf_counter()
         runtime = SingletonModelRuntime(
             manifest,
-            str(root / "checkpoints" / "best_model.pth"),
+            str(checkpoint_path),
             device="cpu",
         )
         model_load_ms = (time.perf_counter() - load_started) * 1000.0
@@ -158,9 +163,15 @@ def run_benchmark(root: str | Path) -> dict:
     deadline_ms = max(5000, math.ceil(canonical_p99 * patch_count * 4.0))
     return {
         "schema_version": 1,
-        "artifact_id": "local-cpu-pytorch-v2",
-        "target_id": "local-cpu-pytorch",
+        "artifact_id": (
+            "local-cpu-pytorch-v2"
+            if manifest.model_task == "patch_classification"
+            else "segformer-b0-local-cpu-v1"
+        ),
+        "target_id": deployment_profile.get("target_id", "local-cpu-pytorch"),
         "runtime": "pytorch",
+        "model_task": manifest.model_task,
+        "model_release_id": manifest.model_release_id,
         "generated_at": "1970-01-01T00:00:00Z",
         "input_spec_id": manifest.input_spec.input_spec_id,
         "batch_sizes": [1],
@@ -234,9 +245,9 @@ def run_batch_matrix(
         raise ValueError("batch_sizes must contain positive integers")
     if samples <= 0:
         raise ValueError("samples must be positive")
-    deployment_profile = yaml.safe_load((root / "sat_ai" / "deployment_profile.yaml").read_text(encoding="utf-8"))
+    deployment_profile, manifest_path, checkpoint_path = _load_active_profile(root)
     configure_cpu_runtime(int(deployment_profile["cpu_threads"]))
-    manifest = load_model_manifest(root / "sat_ai" / "model_manifest.yaml", root / "checkpoints" / "best_model.pth")
+    manifest = load_model_manifest(manifest_path, checkpoint_path)
     lut = ThresholdLUT.from_file(root / "protocol" / "golden_vectors" / "threshold_lut.bin", manifest.threshold_lut_sha256)
     target_records: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="cube-nano-batch-matrix-") as directory_value:
@@ -260,7 +271,7 @@ def run_batch_matrix(
                 target_records.append(record)
                 continue
             try:
-                runtime = SingletonModelRuntime(manifest, str(root / "checkpoints" / "best_model.pth"), device=device)
+                runtime = SingletonModelRuntime(manifest, str(checkpoint_path), device=device)
             except Exception as exc:
                 record["status"] = "UNAVAILABLE"
                 record["reason"] = f"runtime initialization failed: {type(exc).__name__}"
@@ -269,6 +280,12 @@ def run_batch_matrix(
             try:
                 with open_memmap_scene(source_path, sidecar_path) as scene:
                     for batch_size in batch_sizes:
+                        if manifest.model_task == "semantic_cloud_segmentation" and batch_size != 1:
+                            record["measurements"].append({
+                                "batch_size": batch_size,
+                                "status": "UNSUPPORTED_FIXED_MVP_BATCH",
+                            })
+                            continue
                         infer_region(scene, ROI(0, 0, 1024, 1024), runtime, config, batch_size=batch_size)
                         measurements: list[float] = []
                         rss_before = _rss_bytes()
@@ -295,6 +312,8 @@ def run_batch_matrix(
         "artifact_id": "phase6-batch-matrix-v1",
         "generated_at": _timestamp_for_artifact(),
         "input_spec_id": manifest.input_spec.input_spec_id,
+        "model_task": manifest.model_task,
+        "model_release_id": manifest.model_release_id,
         "batch_sizes": list(batch_sizes),
         "samples_per_batch": samples,
         "targets": target_records,
