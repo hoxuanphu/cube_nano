@@ -73,6 +73,7 @@ class WorkerProcessClient:
         on_started: Callable[[WorkerRequest], None] | None = None,
         on_state_change: Callable[[str], None] | None = None,
         process_target: Callable[..., None] = worker_process_main,
+        deployment_profile_path: str | Path | None = None,
     ):
         self.root = str(Path(root).resolve())
         self.device = device
@@ -81,6 +82,7 @@ class WorkerProcessClient:
         self.on_started = on_started
         self.on_state_change = on_state_change
         self.process_target = process_target
+        self.deployment_profile_path = None if deployment_profile_path is None else str(Path(deployment_profile_path).resolve())
         self._context = multiprocessing.get_context("spawn")
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -137,17 +139,22 @@ class WorkerProcessClient:
         self._ready.clear()
         self._deadline_cancel_sent_ns = None
         self._cancel_sent_ns = None
+        worker_args = (
+            self.root,
+            self.device,
+            self.request_queue,
+            self.control_queue,
+            self.result_queue,
+            self.stop_event,
+            self.policy.heartbeat_interval_ms,
+        )
+        if self.deployment_profile_path is not None:
+            if self.process_target is not worker_process_main:
+                raise ValueError("deployment_profile_path requires the default worker process target")
+            worker_args = (*worker_args, self.deployment_profile_path)
         self.process = self._context.Process(
             target=self.process_target,
-            args=(
-                self.root,
-                self.device,
-                self.request_queue,
-                self.control_queue,
-                self.result_queue,
-                self.stop_event,
-                self.policy.heartbeat_interval_ms,
-            ),
+            args=worker_args,
             name="sat-ai-worker",
             daemon=True,
         )

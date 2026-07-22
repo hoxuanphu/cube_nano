@@ -8,12 +8,13 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
 from protocol.profile import MissionProfile, load_fprime_constants
 from protocol.slo import SloProfile
+from sat_ai.contracts import AcceptanceProfile, TargetDeploymentSpec
 from sat_ai.manifest import ModelManifest, load_model_manifest
 from sat_ai.products import cleanup_staging_products
 from sat_ai.threshold_lut import ThresholdLUT
@@ -23,6 +24,36 @@ from .journal import SatelliteJournal
 
 
 logger = logging.getLogger(__name__)
+
+
+def validate_segmentation_release_contracts(
+    manifest: ModelManifest,
+    deployment_profile: Mapping[str, Any],
+    acceptance_profile: AcceptanceProfile | None,
+    target_deployment_spec: TargetDeploymentSpec | None,
+) -> None:
+    """Prevent a pilot SegFormer contract from being promoted by profile edits alone."""
+
+    if manifest.model_task != "semantic_cloud_segmentation":
+        return
+    if acceptance_profile is None:
+        raise ValueError("SegFormer deployment requires an acceptance profile")
+    if acceptance_profile.profile_id != manifest.acceptance_profile_id:
+        raise ValueError("SegFormer acceptance profile does not match model manifest")
+    if target_deployment_spec is None:
+        raise ValueError("SegFormer deployment requires a target deployment spec")
+    if target_deployment_spec.target_id != deployment_profile.get("target_id"):
+        raise ValueError("SegFormer target deployment spec does not match deployment profile")
+    if target_deployment_spec.batch_size != int(deployment_profile.get("batch_size", 0)):
+        raise ValueError("SegFormer target batch size does not match deployment profile")
+    if not deployment_profile.get("deployable"):
+        return
+    if deployment_profile.get("ready") is not True:
+        raise ValueError("deployable SegFormer profile must be explicitly ready")
+    if manifest.assurance_level != "validated":
+        raise ValueError("deployable SegFormer manifest must be validated")
+    if acceptance_profile.status != "approved":
+        raise ValueError("deployable SegFormer acceptance profile must be approved")
 
 
 class DeploymentState(str, Enum):
@@ -46,10 +77,14 @@ class SatelliteDeployment:
         *,
         state_directory: str | Path | None = None,
         product_directory: str | Path | None = None,
+        deployment_profile_path: str | Path | None = None,
     ):
         self.root = Path(root).resolve()
         self.state_directory = Path(state_directory or self.root / "data" / "satellite" / "state").resolve()
         self.product_directory = Path(product_directory or self.root / "data" / "satellite" / "products").resolve()
+        self.deployment_profile_path = Path(
+            deployment_profile_path or self.root / "sat_ai" / "deployment_profile.yaml"
+        ).resolve()
         self.state_directory.mkdir(parents=True, exist_ok=True)
         self.product_directory.mkdir(parents=True, exist_ok=True)
         self.readiness = DeploymentReadiness(DeploymentState.STARTING)
@@ -61,6 +96,8 @@ class SatelliteDeployment:
         self.deployment_profile: dict[str, Any] | None = None
         self.benchmark_artifact: dict[str, Any] | None = None
         self.slo_profile: SloProfile | None = None
+        self.acceptance_profile: AcceptanceProfile | None = None
+        self.target_deployment_spec: TargetDeploymentSpec | None = None
         logger.info(
             "deployment_start root=%s state_directory=%s product_directory=%s",
             self.root,
@@ -73,15 +110,28 @@ class SatelliteDeployment:
         try:
             self.profile = MissionProfile.from_file(self.root / "protocol" / "mission_profile.yaml")
             load_fprime_constants(self.root / "fprime_dictionary.json")
-            self.manifest = load_model_manifest(
-                self.root / "sat_ai" / "model_manifest.yaml",
-                self.root / "checkpoints" / "best_model.pth",
+            self.deployment_profile = yaml.safe_load(self.deployment_profile_path.read_text(encoding="utf-8"))
+            manifest_path = self.root / str(self.deployment_profile.get("model_manifest_path", "sat_ai/model_manifest.yaml"))
+            checkpoint_path = self.root / str(self.deployment_profile.get("checkpoint_path", "checkpoints/best_model.pth"))
+            self.manifest = load_model_manifest(manifest_path, checkpoint_path)
+            if self.manifest.model_task != str(self.deployment_profile.get("model_task", "patch_classification")):
+                raise ValueError("deployment profile model_task does not match model manifest")
+            acceptance_path = self.deployment_profile.get("acceptance_profile_path")
+            if acceptance_path:
+                self.acceptance_profile = AcceptanceProfile.from_file(self.root / str(acceptance_path))
+            target_path = self.deployment_profile.get("target_deployment_spec_path")
+            if target_path:
+                self.target_deployment_spec = TargetDeploymentSpec.from_file(self.root / str(target_path))
+            validate_segmentation_release_contracts(
+                self.manifest,
+                self.deployment_profile,
+                self.acceptance_profile,
+                self.target_deployment_spec,
             )
             self.lut = ThresholdLUT.from_file(
                 self.root / "protocol" / "golden_vectors" / "threshold_lut.bin",
-                self.manifest.threshold_lut_sha256,
+                self.manifest.threshold_lut_sha256 or None,
             )
-            self.deployment_profile = yaml.safe_load((self.root / "sat_ai" / "deployment_profile.yaml").read_text(encoding="utf-8"))
             self._validate_benchmark()
             self.slo_profile = SloProfile.from_file(self.root / "protocol" / "slo_profile.yaml")
             assert self.benchmark_artifact is not None
@@ -188,6 +238,13 @@ class SatelliteDeployment:
             "spacecraft_instance_id": f"{self.profile.spacecraft_instance_id:016x}" if self.profile else None,
             "sender_boot_id": self.journal.boot_id if self.journal else None,
             "model_release_id": self.manifest.model_release_id if self.manifest else None,
+            "model_task": self.manifest.model_task if self.manifest else None,
+            "model_contracts": None if self.manifest is None else {
+                "input_spec_id": self.manifest.input_spec.input_spec_id,
+                "decision_spec_id": None if self.manifest.decision_spec is None else self.manifest.decision_spec.decision_spec_id,
+                "postprocess_id": None if self.manifest.postprocess_spec is None else self.manifest.postprocess_spec.postprocess_id,
+                "product_spec_id": None if self.manifest.product_spec is None else self.manifest.product_spec.product_spec_id,
+            },
             "model_assurance": self.manifest.assurance_level if self.manifest else None,
             "slo_revision": self.slo_profile.config_revision if self.slo_profile else None,
             "catalog_epoch": self.catalog.epoch if self.catalog else None,

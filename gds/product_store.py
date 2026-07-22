@@ -68,10 +68,15 @@ class ProductManifest:
         if reserved.intersection(self.metadata):
             raise ProductVerificationError("MANIFEST_SCHEMA_ERROR", "manifest metadata shadows an envelope field")
         required = {
-            "ANALYSIS": {"scene_ref", "source_sha256", "roi", "config_snapshot", "model_release_id", "science_decision", "cloud_positive_tile_area_ratio_bp"},
+            "ANALYSIS": {"scene_ref", "source_sha256", "roi", "config_snapshot", "model_release_id", "science_decision"},
             "PREVIEW": {"scene_ref", "source_sha256", "display_profile"},
             "CATALOG": {"catalog_epoch", "catalog_revision", "snapshot_sha256"},
         }.get(self.product_type)
+        if self.product_type == "ANALYSIS":
+            if self.metadata.get("model_task") == "semantic_cloud_segmentation":
+                required = required | {"pixel_cloud_ratio_bp"}
+            else:
+                required = required | {"cloud_positive_tile_area_ratio_bp"}
         if required is not None and not required.issubset(self.metadata):
             missing = sorted(required - set(self.metadata))
             raise ProductVerificationError("MANIFEST_SCHEMA_ERROR", f"{self.product_type} manifest is missing {missing}")

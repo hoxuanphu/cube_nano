@@ -96,6 +96,11 @@ def _execute_request(
             int(config_value["model_threshold_bp"]),
             int(config_value["coverage_limit_bp"]),
         )
+        if runtime.manifest.model_task == "semantic_cloud_segmentation":
+            decision = runtime.manifest.decision_spec
+            if decision is None:
+                raise ValueError("SegFormer manifest is missing DecisionSpec")
+            decision.require_config(config.model_threshold_bp, config.coverage_limit_bp)
         roi = ROI.from_dict(snapshot["roi"])
         product_ref = ProductRef.from_dict(snapshot["product_ref"])
         origin = RequestKey.from_dict(snapshot["origin_request_key"])
@@ -106,6 +111,10 @@ def _execute_request(
         if domain_status == "DOMAIN_MISMATCH":
             raise ValueError("DOMAIN_MISMATCH")
         expected_contract = runtime.manifest.input_contract()
+        if snapshot.get("model_task") != runtime.manifest.model_task:
+            raise ValueError("MODEL_TASK_SNAPSHOT_MISMATCH")
+        if snapshot.get("model_release_id") != runtime.manifest.model_release_id:
+            raise ValueError("MODEL_RELEASE_SNAPSHOT_MISMATCH")
         if snapshot.get("input_spec_id") != expected_contract["input_spec_id"]:
             raise ValueError("INPUT_SPEC_SNAPSHOT_MISMATCH")
         if snapshot.get("input_contract") != expected_contract:
@@ -128,6 +137,13 @@ def _execute_request(
                 domain=domain if isinstance(domain, dict) else None,
             )
             guard()
+            for provenance_key in (
+                "acceptance_profile_id",
+                "target_id",
+                "deployment_profile_id",
+            ):
+                if provenance_key in snapshot:
+                    result[provenance_key] = snapshot[provenance_key]
             result["scene_ref"] = snapshot["scene_ref"]
             result["product_ref"] = product_ref.as_dict()
             product_summary = build_products(
@@ -139,7 +155,11 @@ def _execute_request(
                 source_sha256=str(scene_value["source_sha256"]),
             )
         guard()
-        result_summary = {name: value for name, value in result.items() if name != "cloud_mask"}
+        result_summary = {
+            name: value
+            for name, value in result.items()
+            if name not in {"cloud_mask", "validity_mask"}
+        }
         result_summary["product"] = product_summary
         return WorkerResult(request.request_key, WorkerResultState.SUCCEEDED, result_summary)
     except InsufficientValidData:
@@ -186,6 +206,7 @@ def worker_process_main(
     result_queue: Any,
     stop_event: Any,
     heartbeat_interval_ms: int,
+    deployment_profile_path: str | None = None,
 ) -> None:
     """Multiprocessing target. All queue payloads are canonical JSON bytes."""
 
@@ -242,22 +263,39 @@ def worker_process_main(
     control_thread.start()
     runtime: SingletonModelRuntime | None = None
     try:
-        deployment_profile = yaml.safe_load(
-            (root_path / "sat_ai" / "deployment_profile.yaml").read_text(encoding="utf-8")
+        profile_path = (
+            root_path / "sat_ai" / "deployment_profile.yaml"
+            if deployment_profile_path is None
+            else Path(deployment_profile_path)
+        )
+        if not profile_path.is_absolute():
+            profile_path = root_path / profile_path
+        deployment_profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        model_task = str(deployment_profile.get("model_task", "patch_classification"))
+        manifest_path = root_path / str(
+            deployment_profile.get(
+                "model_manifest_path",
+                "sat_ai/model_manifest.yaml",
+            )
+        )
+        checkpoint_path = root_path / str(
+            deployment_profile.get("checkpoint_path", "checkpoints/best_model.pth")
         )
         if device == "cpu":
             configure_cpu_runtime(int(deployment_profile["cpu_threads"]))
         manifest = load_model_manifest(
-            root_path / "sat_ai" / "model_manifest.yaml",
-            root_path / "checkpoints" / "best_model.pth",
+            manifest_path,
+            checkpoint_path,
         )
+        if manifest.model_task != model_task:
+            raise ValueError("deployment profile model_task does not match model manifest")
         lut = ThresholdLUT.from_file(
             root_path / "protocol" / "golden_vectors" / "threshold_lut.bin",
             manifest.threshold_lut_sha256,
         )
         runtime = SingletonModelRuntime(
             manifest,
-            str(root_path / "checkpoints" / "best_model.pth"),
+            str(checkpoint_path),
             device=device,
         )
         with state_lock:

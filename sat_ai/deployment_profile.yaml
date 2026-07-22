@@ -1,11 +1,15 @@
 schema_version: 1
+profile_id: cloud-mobilenetv3-small-rgb-local-cpu-v1
+model_task: patch_classification
+model_manifest_path: sat_ai/model_manifest.yaml
+checkpoint_path: checkpoints/best_model.pth
 target_id: local-cpu-pytorch
 runtime: pytorch
 runtime_version: "2.13.0+cpu"
 cpu_threads: 1
 deployable: true
 benchmark_artifact_id: local-cpu-pytorch-v2
-benchmark_artifact_sha256: "e5937eb6def458ffbe12f3be7479c91e24e77e713888bd79adbbf0805722deaf"
+benchmark_artifact_sha256: "91194d9a78b84115b1931156fbc3d3a79375b60052394103d4c9c0a14fa71b2a"
 batch_size: 1
 max_batch_size: 1
 progress_min_delta_bp: 100

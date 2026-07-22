@@ -1,7 +1,7 @@
 schema_version: 1
 config_revision: phase6-local-cpu-v1
 benchmark_artifact_id: local-cpu-pytorch-v2
-benchmark_artifact_sha256: e5937eb6def458ffbe12f3be7479c91e24e77e713888bd79adbbf0805722deaf
+benchmark_artifact_sha256: 91194d9a78b84115b1931156fbc3d3a79375b60052394103d4c9c0a14fa71b2a
 oldest_ack_age_ms: 1000
 health_max_latency_ms: 2000
 file_min_goodput_bps: 1
