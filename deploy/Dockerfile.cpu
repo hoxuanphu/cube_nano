@@ -1,0 +1,27 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    CUBE_NANO_RUNTIME_PROFILE=/app/deploy/compose_runtime_profile.yaml
+
+WORKDIR /app
+COPY requirements-lock.txt deploy/requirements-cpu.txt /app/
+RUN python -m pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-cpu.txt
+
+COPY protocol /app/protocol
+COPY sat_ai /app/sat_ai
+COPY flight /app/flight
+COPY gds /app/gds
+COPY link_sim /app/link_sim
+COPY src/models /app/src/models
+COPY src/inference.py /app/src/inference.py
+COPY fprime_dictionary.json /app/fprime_dictionary.json
+COPY checkpoints/best_model.pth /app/checkpoints/best_model.pth
+COPY artifacts/benchmarks/local-cpu-pytorch-v2.json /app/artifacts/benchmarks/local-cpu-pytorch-v2.json
+COPY deploy/compose_runtime_profile.yaml /app/deploy/compose_runtime_profile.yaml
+COPY deploy/fault_profiles /app/deploy/fault_profiles
+COPY deploy/create_cpu_fixture.py /app/deploy/create_cpu_fixture.py
+RUN PYTHONPATH=/app python deploy/create_cpu_fixture.py --root /app
+
+EXPOSE 8000
+CMD ["python", "-m", "gds.http_app", "--host", "0.0.0.0", "--port", "8000"]

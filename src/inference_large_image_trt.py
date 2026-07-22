@@ -1,4 +1,6 @@
 import numpy as np
+
+LEGACY_DEV_ONLY = True
 import time
 import math
 import argparse
@@ -561,7 +563,7 @@ def process_large_image(
     engine_path,
     out_mask="cloud_mask_output.tif",
     patch_size=256,
-    channels=4,
+    channels=3,
     batch_size=1,
     array_key=None,
     threshold=0.5,
@@ -584,6 +586,7 @@ def process_large_image(
     _memory_provider=None,
     _filesystem_provider=None,
     _trt_infer_factory=None,
+    _backend_name="TensorRT",
 ):
     """
     Xử lý ảnh vệ tinh cực lớn (ví dụ 10000x10000) bằng phương pháp Cửa sổ trượt (Sliding Window)
@@ -627,8 +630,8 @@ def process_large_image(
         tiff_cache_dir,
     )
 
-    # Resource guards are evaluated after TensorRT/CUDA allocations.
-    print("Khởi tạo TensorRT...")
+    # Resource guards are evaluated after model/runtime allocations.
+    print(f"Initializing {_backend_name}...")
     if _trt_infer_factory is None:
         from inference_tensorrt import CloudTRTInfer
 
@@ -644,7 +647,7 @@ def process_large_image(
     )
 
     filesystem_provider = _filesystem_provider or FilesystemInfoProvider()
-    print(f"Đang đọc metadata ảnh từ {large_image_path}...")
+    print(f"Reading image metadata from {large_image_path}...")
     if image_path.suffix.lower() in TIFF_EXTENSIONS:
         reader = TiffReader(
             image_path,
@@ -683,15 +686,15 @@ def process_large_image(
         H_img, W_img, C_img = reader.shape
         if C_img != input_spec.channels:
             raise ValueError(
-                f"Image reader outputs {C_img} channels but engine input requires "
+                f"Image reader outputs {C_img} channels but {_backend_name} input requires "
                 f"{input_spec.channels}"
             )
 
         num_patches_h = math.ceil(H_img / patch_size)
         num_patches_w = math.ceil(W_img / patch_size)
         total_patches = num_patches_h * num_patches_w
-        print(f"Kích thước ảnh: {H_img}x{W_img}x{C_img}")
-        print(f"Tổng số ô {patch_size}x{patch_size} cần xử lý: {total_patches}")
+        print(f"Image size: {H_img}x{W_img}x{C_img}")
+        print(f"Total {patch_size}x{patch_size} patches: {total_patches}")
 
         start_time = time.time()
         with _MaskCache(mask_path, (H_img, W_img), owns_mask_cache) as cloud_mask:
@@ -727,7 +730,7 @@ def process_large_image(
 
                         processed_count += len(batch_patches)
                         if processed_count % 1000 == 0:
-                            print(f"Đã xử lý: {processed_count}/{total_patches} patches...")
+                            print(f"Processed: {processed_count}/{total_patches} patches...")
                         batch_patches = []
                         batch_coords = []
 
@@ -747,23 +750,23 @@ def process_large_image(
             else 0
         )
 
-    print(f"\nHoàn tất! Tổng thời gian xử lý ảnh {H_img}x{W_img}: {elapsed:.2f} giây")
+    print(f"\nCompleted {H_img}x{W_img} image in {elapsed:.2f} seconds")
     print(
-        f"Tỷ lệ vùng bị đánh dấu mây: {cloud_coverage:.2%} "
-        f"(ngưỡng loại: {cloud_coverage_threshold:.2%})"
+        f"Cloud-covered mask area: {cloud_coverage:.2%} "
+        f"(rejection threshold: {cloud_coverage_threshold:.2%})"
     )
 
     output_mask = str(output_path)
     if not accepted and discard_cloudy:
         output_path.unlink()
         output_mask = None
-        print("Ảnh bị loại vì tỷ lệ mây đạt ngưỡng; mask đầu ra đã được xóa.")
+        print("Image rejected at the cloud threshold; output mask was removed.")
     elif accepted:
-        print(f"Ảnh được giữ lại; mask mây đã được lưu tại {output_path}.")
+        print(f"Image accepted; cloud mask saved to {output_path}.")
     else:
         print(
-            f"Ảnh bị đánh dấu loại; mask vẫn được giữ tại {output_path}. "
-            "Dùng --discard-cloudy để xóa mask bị loại."
+            f"Image marked as rejected; mask retained at {output_path}. "
+            "Use --discard-cloudy to remove rejected masks."
         )
 
     return {
@@ -791,7 +794,8 @@ if __name__ == '__main__':
     parser.add_argument("--engine", type=str, default="cloud_model.engine", help="Path to TensorRT engine")
     parser.add_argument("--out_mask", type=str, default="cloud_mask_output.tif", help="Output mask path")
     parser.add_argument("--patch_size", type=int, default=256)
-    parser.add_argument("--channels", type=int, default=4, choices=[3, 4])
+    parser.add_argument("--channels", type=int, default=3, choices=[3, 4])
+    parser.add_argument("--legacy", action="store_true", help="Explicitly enable the legacy 4-channel development path")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
         "--array_key",
@@ -841,6 +845,8 @@ if __name__ == '__main__':
     parser.add_argument("--engine_manifest", type=str, default=None)
     parser.add_argument("--production_contract", action="store_true")
     args = parser.parse_args()
+    if args.channels == 4 and not args.legacy:
+        raise RuntimeError("legacy 4-channel inference requires --legacy")
 
     if args.tiff_read_mode == "stream":
         if args.tiff_cache_mode != "auto":

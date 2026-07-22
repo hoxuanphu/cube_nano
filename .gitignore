@@ -4,10 +4,21 @@ __pycache__/
 *$py.class
 .pytest_cache/
 .ruff_cache/
+.pytest_cache/
+data/satellite/state*/
+data/satellite/products/*
+!data/satellite/products/.gitkeep
+data/ground/products/*
+!data/ground/products/.gitkeep
 .mypy_cache/
 .coverage
 htmlcov/
 .cube_nano-cache/
+
+# GDS web generated dependencies and browser test output
+gds/web/node_modules/
+gds/web/artifacts/
+gds/web/test-results/
 
 # Virtual environments
 .venv/
@@ -34,3 +45,5 @@ Thumbs.db
 *.ckpt
 *.log
 *.hdf
+.claude
+.codex

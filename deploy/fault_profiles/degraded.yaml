@@ -1,0 +1,15 @@
+schema_version: 1
+profile_id: p6_degraded
+revision: 2
+seed: "0000000000000042"
+uplink:
+  frame_loss_rate_ppm: 50000
+  frame_duplicate_rate_ppm: 10000
+  corrupt_frame_rate_ppm: 10000
+  bits_per_corrupt_frame: 1
+downlink:
+  frame_loss_rate_ppm: 100000
+  frame_duplicate_rate_ppm: 20000
+  corrupt_frame_rate_ppm: 20000
+  bits_per_corrupt_frame: 1
+contact: OPEN

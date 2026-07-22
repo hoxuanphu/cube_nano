@@ -1,0 +1,15 @@
+schema_version: 1
+profile_id: p6_lossless
+revision: 1
+seed: "000000000000002a"
+uplink:
+  frame_loss_rate_ppm: 0
+  frame_duplicate_rate_ppm: 0
+  corrupt_frame_rate_ppm: 0
+  bits_per_corrupt_frame: 0
+downlink:
+  frame_loss_rate_ppm: 0
+  frame_duplicate_rate_ppm: 0
+  corrupt_frame_rate_ppm: 0
+  bits_per_corrupt_frame: 0
+contact: OPEN

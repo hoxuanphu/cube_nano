@@ -1,0 +1,14 @@
+schema_version: 1
+profile_id: jetson-l4t-tensorrt
+target_id: jetson-l4t
+runtime: tensorrt
+base_image: nvcr.io/nvidia/l4t-ml:r36.2.0-py3
+deployable: false
+ready: false
+benchmark_artifact_id: null
+benchmark_artifact_sha256: null
+blocked_reason: target benchmark and TensorRT optimization profile are not present
+required_artifacts:
+  - TensorRT engine hash
+  - batch matrix on target Jetson
+  - shared-memory/RSS guard
