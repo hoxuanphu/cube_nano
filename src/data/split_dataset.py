@@ -206,6 +206,17 @@ def main():
                 for old_file in out_dir.glob("*.npy"):
                     old_file.unlink()
 
+    # Compute lineage before a move operation removes files from src_root.
+    lineage_id = scene_split_lineage_id(
+        src_root,
+        scene_splits,
+        preprocessing_config={
+            "patch_size": "source-manifest-defined",
+            "validity": "separate-mask-or-all-valid",
+            "seed": args.seed,
+        },
+    )
+
     # Copy/move patches grouped by scene
     manifest = {}
     for split, scene_ids in scene_splits.items():
@@ -245,15 +256,6 @@ def main():
             f"cloud={counts['cloud']}, clear={counts['clear']}, masks={mask_count}"
         )
 
-    lineage_id = scene_split_lineage_id(
-        src_root,
-        scene_splits,
-        preprocessing_config={
-            "patch_size": "source-manifest-defined",
-            "validity": "separate-mask-or-all-valid",
-            "seed": args.seed,
-        },
-    )
     for details in manifest.values():
         details["lineage_id"] = lineage_id
         details["validity_artifact"] = validity_paths is not None
