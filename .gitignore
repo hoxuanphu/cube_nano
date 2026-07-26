@@ -34,3 +34,9 @@ Thumbs.db
 *.ckpt
 *.log
 *.hdf
+.claude
+.codex
+gds/
+build/
+settings.json
+src/*.egg-info/

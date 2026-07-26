@@ -26,6 +26,7 @@ class SafeAction(str, Enum):
 
 class FailureReason(str, Enum):
     INVALID_REQUEST = "INVALID_REQUEST"
+    REQUEST_TYPE_INVALID = "REQUEST_TYPE_INVALID"
     CAPTURE_INCOMPLETE = "CAPTURE_INCOMPLETE"
     SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"
     SOURCE_FINGERPRINT_MISMATCH = "SOURCE_FINGERPRINT_MISMATCH"
@@ -35,8 +36,15 @@ class FailureReason(str, Enum):
     CALIBRATION_UNSUPPORTED = "CALIBRATION_UNSUPPORTED"
     TRUST_REJECTED = "TRUST_REJECTED"
     SIGNATURE_INVALID = "SIGNATURE_INVALID"
+    ISSUER_UNTRUSTED = "ISSUER_UNTRUSTED"
+    KEY_UNTRUSTED = "KEY_UNTRUSTED"
+    TRUST_EXPIRED = "TRUST_EXPIRED"
+    TRUST_NOT_YET_VALID = "TRUST_NOT_YET_VALID"
+    GENERATION_MISMATCH = "GENERATION_MISMATCH"
+    FINGERPRINT_LINKAGE_MISMATCH = "FINGERPRINT_LINKAGE_MISMATCH"
     RESOURCE_PREFLIGHT = "RESOURCE_PREFLIGHT_REJECTED"
     RESOURCE_RUNTIME = "RESOURCE_RUNTIME_REJECTED"
+    RESOURCE_OBSERVATION_UNAVAILABLE = "RESOURCE_OBSERVATION_UNAVAILABLE"
     CODEC_UNAVAILABLE = "CODEC_UNAVAILABLE"
     ARTIFACT_INCOMPLETE = "ARTIFACT_INCOMPLETE"
     ARTIFACT_CHECKSUM_MISMATCH = "ARTIFACT_CHECKSUM_MISMATCH"
@@ -44,9 +52,11 @@ class FailureReason(str, Enum):
     IO_ERROR = "IO_ERROR"
     WARP_ERROR = "WARP_ERROR"
     NON_FINITE_OUTPUT = "NON_FINITE_OUTPUT"
+    RUNTIME_FAULT = "RUNTIME_FAULT"
     PATCH_RESULT_INCOMPLETE = "PATCH_RESULT_INCOMPLETE"
     PATCH_RESULT_DUPLICATE = "PATCH_RESULT_DUPLICATE"
     PATCH_RESULT_MISSING = "PATCH_RESULT_MISSING"
+    PATCH_RESULT_CHECKSUM_MISMATCH = "PATCH_RESULT_CHECKSUM_MISMATCH"
     NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
     UNKNOWN = "UNKNOWN"
 
@@ -116,6 +126,7 @@ class StateMachine:
 
     def __init__(self):
         self.state = RunState.NEW
+        self.history = [self.state]
 
     def transition(self, state):
         state = RunState(state)
@@ -123,4 +134,9 @@ class StateMachine:
         if state not in allowed:
             raise RuntimeError(f"Invalid preprocessing state transition {self.state.value} -> {state.value}")
         self.state = state
+        self.history.append(state)
         return self.state
+
+    @property
+    def state_history(self):
+        return tuple(self.history)

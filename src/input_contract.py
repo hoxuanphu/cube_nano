@@ -286,6 +286,19 @@ class NormalizationSpec:
             raise ValueError("Normalization produced NaN or infinite values")
         return np.asarray(result, dtype=np.float32)
 
+    def to_mapping(self):
+        result = {
+            "id": self.id,
+            "kind": self.kind,
+            "scale": self.scale,
+            "offset": self.offset,
+            "mean": self.mean,
+            "std": self.std,
+        }
+        if self.clip_min is not None:
+            result["clip"] = (self.clip_min, self.clip_max)
+        return result
+
 
 @dataclass(frozen=True)
 class EngineInputSpec:
@@ -308,6 +321,35 @@ class EngineInputSpec:
         if self.input_shape[2] != self.input_shape[3]:
             raise ValueError(f"Engine input must use square patches, got {self.input_shape[2:]}")
         return self.input_shape[2]
+
+    def to_model_compatibility_profile(self, *, runtime_fingerprint):
+        """Adapt the legacy engine contract to the preprocessing model contract.
+
+        The two schemas are intentionally not aliases.  A legacy spec can be
+        adapted only when it carries an engine fingerprint and the caller
+        supplies the deployment runtime fingerprint required by the new
+        contract.
+        """
+
+        from preprocessing import ModelCompatibilityProfile
+
+        if self.engine_digest is None:
+            raise ValueError(
+                "legacy EngineInputSpec requires engine_digest before it can be adapted"
+            )
+        return ModelCompatibilityProfile(
+            profile_id=self.input_spec_id,
+            profile_version=f"legacy-{self.schema_version}",
+            model_fingerprint=self.engine_digest,
+            required_band_order=self.band_order,
+            tensor_layout="NCHW",
+            tensor_dtype=self.input_dtype,
+            patch_size=(self.patch_size, self.patch_size),
+            batch_size=self.input_shape[0],
+            padding_policy="reject",
+            normalization=self.normalization.to_mapping(),
+            runtime_fingerprint=runtime_fingerprint,
+        )
 
 
 def load_engine_manifest(path, engine_path=None, verify_fingerprint=True):

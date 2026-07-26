@@ -77,8 +77,8 @@ RawCaptureReader
 | "WarpBackend" | Áp dụng distortion, co-registration và resampling theo plan | Normalize, chọn patch size, chọn tensor layout hoặc tự chọn profile |
 | "ArtifactWriter" | Ghi output, masks, mapping, checksum và manifest nguyên tử | Publish artifact dở dang |
 | "InferenceAdapter" | Kiểm tra tương thích model, chọn/reorder band, patch, normalization, HWC-to-NCHW và TensorRT | Đọc raw source hoặc tự warp |
-| "ReferencePipeline" | Gọi public preprocessing facade rồi chuyển artifact sang reference consumer | Import private backend hoặc tự lặp lại read/warp/normalize |
-| "ReferencePreprocessedInference" | Chỉ nhận "PreprocessArtifact" đã xác thực và chạy adapter | Nhận raw image/path/ndarray, mở ảnh phụ hoặc gọi source reader |
+| "PreprocessingPipeline" | Gọi public preprocessing facade rồi chuyển artifact sang inference consumer | Import private backend hoặc tự lặp lại read/warp/normalize |
+| "PreprocessedInference" | Chỉ nhận "PreprocessArtifact" đã xác thực và chạy adapter | Nhận raw image/path/ndarray, mở ảnh phụ hoặc gọi source reader |
 | "DecisionPolicy/OBC" | Quyết định giữ/xóa và thực thi xóa | Cho Jetson quyền xóa source |
 
 Core có thể chạy và publish "PreprocessArtifact" mà không có engine. Một pipeline
@@ -282,8 +282,8 @@ src/preprocessing/
   artifact_reader.py    # verify và đọc model-grid artifact
   errors.py             # error classes và reason codes
 src/inference_adapter.py         # model-specific, ngoài preprocessing core
-src/reference_preprocessed_inference.py
-                                 # reference consumer chỉ nhận PreprocessArtifact
+src/preprocessed_inference.py
+                                 # inference consumer chỉ nhận PreprocessArtifact
 src/preprocess_for_inference.py  # CLI/orchestration dùng public facade
 pyproject.toml                   # src-layout package/install contract
 ~~~
@@ -421,7 +421,7 @@ thể verify/open/read bằng facade.
 Reference implementation hiện tại là "src/inference_large_image_trt.py". Giữ
 CLI legacy như compatibility wrapper trong development, nhưng production path
 phải gọi public facade. Tạo thêm
-"src/reference_preprocessed_inference.py" làm reference consumer chuẩn. Có hai
+"src/preprocessed_inference.py" làm inference consumer chuẩn. Có hai
 mode orchestration tường minh:
 
 1. raw mode: gọi "preprocess_capture()" đúng một lần rồi đưa artifact vào
@@ -430,13 +430,13 @@ mode orchestration tường minh:
    không re-warp.
 
 ~~~text
-reference.process_capture(request)
+inference.process_capture(request)
   -> preprocessing.preprocess_capture(request.preprocessing)
      hoặc preprocessing.open_preprocessed_artifact(request.artifact)
   -> PreprocessFailure => RETAIN_FOR_GROUND
   -> resolve EngineInputSpec và compatibility gate
   -> initialize TensorRT
-  -> ReferencePreprocessedInference(configured_adapter).run(artifact)
+  -> PreprocessedInference(configured_adapter).run(artifact)
 ~~~
 
 "inference_large_image_trt.py" chỉ được import từ package root
@@ -447,7 +447,7 @@ hai implementation preprocessing cùng có thể chạy production.
 
 #### Reference consumer chỉ nhận output của module nắn ảnh
 
-"src/reference_preprocessed_inference.py" không phải raw-image entry point. API
+"src/preprocessed_inference.py" không phải raw-image entry point. API
 reference bắt buộc có dạng:
 
 ~~~python
@@ -455,7 +455,7 @@ from preprocessing import PreprocessArtifact
 from inference_adapter import InferenceAdapter, InferenceResult
 
 
-class PreprocessedInferenceReference:
+class PreprocessedInference:
     def __init__(self, adapter: InferenceAdapter) -> None:
         ...
 
@@ -466,9 +466,9 @@ class PreprocessedInferenceReference:
 Đầu vào ảnh duy nhất của "run()" là "PreprocessArtifact" được trả về từ
 "preprocess_capture()" hoặc "open_preprocessed_artifact()". Engine,
 "EngineInputSpec" và normalization được bind vào "InferenceAdapter" khi khởi
-tạo reference object; chúng là dependency thực thi, không phải image input.
+tạo inference object; chúng là dependency thực thi, không phải image input.
 
-File reference này:
+File inference consumer này:
 
 - chỉ mở dữ liệu qua "artifact.open()" và "ModelGridReader";
 - không nhận source path, artifact path, ndarray hoặc file handle;
@@ -501,7 +501,7 @@ Reference integration test phải chứng minh:
 - clean import và call public facade từ reference;
 - raw mode gọi preprocessing đúng một lần, artifact mode không gọi warp;
 - cả hai mode đều hội tụ tại
-  "PreprocessedInferenceReference.run(PreprocessArtifact)";
+  "PreprocessedInference.run(PreprocessArtifact)";
 - "PreprocessFailure" được truyền thành safe result, không nạp TensorRT;
 - reference không import private preprocessing modules;
 - signature của consumer không nhận path/ndarray và static import test chặn mọi
@@ -514,7 +514,7 @@ phải chứng minh cùng source samples tạo ra cùng tensor sau band order,
 crop/window, padding, normalization và tensor layout.
 
 **Gate:** reference import/call được package đã cài; file
-"reference_preprocessed_inference.py" chỉ nhận "PreprocessArtifact", không đọc
+"preprocessed_inference.py" chỉ nhận "PreprocessArtifact", không đọc
 raw/auxiliary image và không còn duplicate preprocessing trong production path;
 tensor gửi TensorRT khớp engine manifest và pipeline training tương ứng;
 artifact hình học vẫn có thể được dùng bởi engine khác qua adapter tương thích.
@@ -545,7 +545,7 @@ không đủ hoặc inference dở dang đều không thể trở thành decisio
 - Test wheel/editable install, clean-process public import và API version.
 - Reference seam test cho raw/artifact mode, typed failure propagation, call
   count và cấm private imports.
-- Contract test cho "reference_preprocessed_inference.py": "run()" chỉ nhận
+- Contract test cho "preprocessed_inference.py": "run()" chỉ nhận
   "PreprocessArtifact", dùng fake "ModelGridReader", không import/call image
   reader và không mở path khác.
 - Integration test source -> preprocess artifact -> fake TensorRT.
@@ -617,7 +617,7 @@ Module chỉ sẵn sàng khi:
 - "inference_large_image_trt.py" production path gọi public facade; không đọc
   raw source, warp, normalize hoặc transpose bằng implementation riêng.
 - Raw mode gọi warp đúng một lần; artifact mode verify/open mà không re-warp.
-- "reference_preprocessed_inference.py" tồn tại như consumer mẫu; image input
+- "preprocessed_inference.py" tồn tại như consumer mẫu; image input
   duy nhất của "run()" là "PreprocessArtifact", và mọi block/mask/mapping đều
   đến từ artifact đó.
 - Reference consumer không nhận path/ndarray/file handle, không import raw image
