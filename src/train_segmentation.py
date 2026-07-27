@@ -45,6 +45,9 @@ class SegmentationTrainingConfig:
     learning_rate: float = 6e-5
     weight_decay: float = 1e-4
     warmup_epochs: int = 5
+    lr_plateau_patience: int = 5
+    lr_plateau_factor: float = 0.5
+    min_learning_rate: float = 1e-7
     early_stopping_patience: int = 12
     cross_entropy_weight: float = 1.0
     dice_weight: float = 1.0
@@ -59,8 +62,12 @@ class SegmentationTrainingConfig:
     def validate(self) -> None:
         if self.epochs <= 0 or self.batch_size <= 0 or self.warmup_epochs < 0:
             raise ValueError("training epoch and batch settings are invalid")
+        if self.lr_plateau_patience < 0 or not 0 < self.lr_plateau_factor < 1:
+            raise ValueError("learning-rate plateau settings are invalid")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("training optimizer settings are invalid")
+        if self.min_learning_rate < 0 or self.min_learning_rate >= self.learning_rate:
+            raise ValueError("minimum learning rate must be non-negative and below the initial rate")
         if self.ignore_index != 255:
             raise ValueError("ignore_index is pinned to 255")
 
@@ -178,7 +185,7 @@ def evaluate_loss(
 def build_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler: Any,
     *,
     scaler: torch.cuda.amp.GradScaler | None,
     epoch: int,
@@ -249,9 +256,15 @@ def train(
         pretrained_report = load_segformer_mit_b0_encoder(model, config.pretrained_encoder_path)
     model = model.to(selected_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=max(config.epochs - config.warmup_epochs, 1),
+        mode="min",
+        factor=config.lr_plateau_factor,
+        patience=config.lr_plateau_patience,
+        threshold=0.0,
+        threshold_mode="rel",
+        min_lr=config.min_learning_rate,
+        eps=1e-12,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and selected_device.type == "cuda")
     best_loss = float("inf")
@@ -262,10 +275,16 @@ def train(
     for epoch in range(config.epochs):
         train_metrics = train_one_epoch(model, train_loader, optimizer, selected_device, config, scaler=scaler)
         validation_metrics = evaluate_loss(model, validation_loader, selected_device, config)
+        epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
         if epoch >= config.warmup_epochs:
-            scheduler.step()
+            scheduler.step(float(validation_metrics["loss"]))
         global_step += int(train_metrics["optimizer_steps"])
-        record = {"epoch": epoch, "train": train_metrics, "validation": validation_metrics}
+        record = {
+            "epoch": epoch,
+            "learning_rate": epoch_learning_rate,
+            "train": train_metrics,
+            "validation": validation_metrics,
+        }
         history.append(record)
         val_loss = float(validation_metrics["loss"])
         if int(validation_metrics["valid_pixels"]) > 0 and val_loss < best_loss:
@@ -311,6 +330,9 @@ def main() -> None:
     parser.add_argument("--output", default="checkpoints/segformer_b0_rgb_r1.pth")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=6e-5)
+    parser.add_argument("--lr-plateau-patience", type=int, default=5)
+    parser.add_argument("--lr-plateau-factor", type=float, default=0.5)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-7)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--tile-training",
@@ -327,6 +349,9 @@ def main() -> None:
         config=SegmentationTrainingConfig(
             epochs=args.epochs,
             learning_rate=args.learning_rate,
+            lr_plateau_patience=args.lr_plateau_patience,
+            lr_plateau_factor=args.lr_plateau_factor,
+            min_learning_rate=args.min_learning_rate,
             batch_size=args.batch_size,
             seed=args.seed,
             preserve_native_size=not args.tile_training,
