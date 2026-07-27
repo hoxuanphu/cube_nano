@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cube-nano-preprocessing"
+dynamic = ["version"]
+description = "Dataset and model independent geometric preprocessing contracts"
+requires-python = ">=3.10"
+dependencies = ["numpy", "tifffile"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+    "decision_policy",
+    "inference_adapter",
+    "patch_result_writer",
+    "preprocessed_inference",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "preprocessing._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

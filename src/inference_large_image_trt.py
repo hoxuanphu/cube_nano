@@ -19,6 +19,28 @@ from resource_guards import (
 )
 from tiff_reader import ImageBlockReader, ReaderMetrics, TiffReader, close_memmap
 
+
+def process_preprocessed_capture(
+    *,
+    inference,
+    preprocessing_request=None,
+    artifact_request=None,
+):
+    """Compatibility entrypoint for the typed public preprocessing path.
+
+    The facade resolves raw or artifact mode before any TensorRT object is
+    created.  The legacy CLI remains available below for development and
+    existing deployments that have not supplied typed contracts yet.
+    """
+
+    from preprocessed_inference import process_capture
+
+    return process_capture(
+        preprocessing_request=preprocessing_request,
+        artifact_request=artifact_request,
+        inference=inference,
+    )
+
 TIFF_EXTENSIONS = {".tif", ".tiff"}
 PIL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jp2", ".j2k", ".j2c"}
 NUMPY_EXTENSIONS = {".npy", ".npz"}
@@ -586,6 +608,10 @@ def process_large_image(
     _memory_provider=None,
     _filesystem_provider=None,
     _trt_infer_factory=None,
+    preprocessing_request=None,
+    artifact_request=None,
+    inference_runner=None,
+    inference_adapter=None,
     _backend_name="TensorRT",
 ):
     """
@@ -601,6 +627,32 @@ def process_large_image(
     ``discard_cloudy`` only removes the generated output mask when rejected;
     the source image is never deleted.
     """
+    if preprocessing_request is not None or artifact_request is not None:
+        if inference_runner is None:
+            if inference_adapter is None:
+                raise ValueError(
+                    "typed preprocessing mode requires inference_runner or inference_adapter"
+                )
+            from preprocessed_inference import PreprocessedInference
+
+            inference_runner = PreprocessedInference(inference_adapter)
+        return process_preprocessed_capture(
+            inference=inference_runner,
+            preprocessing_request=preprocessing_request,
+            artifact_request=artifact_request,
+        )
+
+    image_path = Path(large_image_path)
+    if production_contract:
+        if engine_manifest is None:
+            raise ValueError("production_contract requires an engine_manifest")
+        if image_path.suffix.lower() in TIFF_EXTENSIONS and input_sidecar is None:
+            raise ValueError("production_contract requires an input_sidecar for TIFF")
+        raise ValueError(
+            "production_contract requires a typed preprocessing_request or artifact_request; "
+            "the legacy raw reader path is development-only"
+        )
+
     if patch_size <= 0:
         raise ValueError("patch_size must be greater than zero")
     if batch_size <= 0:
@@ -609,13 +661,6 @@ def process_large_image(
         raise ValueError("threshold must be between 0 and 1")
     if not 0.0 <= cloud_coverage_threshold <= 1.0:
         raise ValueError("cloud_coverage_threshold must be between 0 and 1")
-
-    image_path = Path(large_image_path)
-    if production_contract:
-        if engine_manifest is None:
-            raise ValueError("production_contract requires an engine_manifest")
-        if image_path.suffix.lower() in TIFF_EXTENSIONS and input_sidecar is None:
-            raise ValueError("production_contract requires an input_sidecar for TIFF")
 
     input_spec = _resolve_input_spec(engine_path, engine_manifest, channels, patch_size)
     budget = ReaderBudget.from_cli(

@@ -47,3 +47,7 @@ Thumbs.db
 *.hdf
 .claude
 .codex
+gds/
+build/
+settings.json
+src/*.egg-info/
