@@ -24,11 +24,19 @@ if __package__ in {None, ""}:
 try:
     from data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
     from losses import masked_segmentation_loss
-    from models.segformer_b0 import SEGFORMER_IMPLEMENTATION_ID, get_segformer_b0
+    from models.segformer_b0 import (
+        SEGFORMER_IMPLEMENTATION_ID,
+        get_segformer_b0,
+        load_segformer_mit_b0_encoder,
+    )
 except ModuleNotFoundError:  # Package invocation: python -m src.train_segmentation
     from src.data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
     from src.losses import masked_segmentation_loss
-    from src.models.segformer_b0 import SEGFORMER_IMPLEMENTATION_ID, get_segformer_b0
+    from src.models.segformer_b0 import (
+        SEGFORMER_IMPLEMENTATION_ID,
+        get_segformer_b0,
+        load_segformer_mit_b0_encoder,
+    )
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,7 @@ class SegmentationTrainingConfig:
     use_amp: bool = True
     batch_size: int = 1
     preserve_native_size: bool = True
+    pretrained_encoder_path: str | None = None
 
     def validate(self) -> None:
         if self.epochs <= 0 or self.batch_size <= 0 or self.warmup_epochs < 0:
@@ -234,7 +243,11 @@ def train(
         num_workers=0,
         collate_fn=native_collate,
     )
-    model = get_segformer_b0().to(selected_device)
+    model = get_segformer_b0()
+    pretrained_report = None
+    if config.pretrained_encoder_path:
+        pretrained_report = load_segformer_mit_b0_encoder(model, config.pretrained_encoder_path)
+    model = model.to(selected_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -285,6 +298,7 @@ def train(
         "history": history,
         "metadata": metadata or {},
         "training_config": asdict(config),
+        "pretrained_encoder": pretrained_report,
     }
     output.with_suffix(".json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     return report

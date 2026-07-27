@@ -7,6 +7,9 @@ the graph contract does not depend on a mutable image-model library default.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, Mapping
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -235,6 +238,116 @@ class SegFormerB0(nn.Module):
 
 class SegFormerB0ForCloudSegmentation(SegFormerB0):
     """Explicit application name used by training and runtime factories."""
+
+
+def load_segformer_mit_b0_encoder(
+    model: SegFormerB0,
+    checkpoint_path: str | Path,
+) -> dict[str, Any]:
+    """Load the Hugging Face ``nvidia/mit-b0`` encoder into the local model."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state: Mapping[str, Tensor]
+    if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("state_dict"), Mapping):
+        state = checkpoint["state_dict"]
+    elif isinstance(checkpoint, Mapping):
+        state = checkpoint
+    else:
+        raise ValueError(f"Unsupported SegFormer pretrained checkpoint: {checkpoint_path}")
+
+    model_state = model.state_dict()
+    mapped: dict[str, Tensor] = {}
+
+    def source_tensor(suffix: str) -> Tensor:
+        for prefix in ("", "segformer.", "encoder."):
+            candidate = state.get(f"{prefix}{suffix}")
+            if isinstance(candidate, Tensor):
+                return candidate.detach().cpu()
+        raise KeyError(f"Missing pretrained SegFormer key: {suffix}")
+
+    def add(local_key: str, source_key: str, value: Tensor | None = None) -> None:
+        tensor = value if value is not None else source_tensor(source_key)
+        if local_key not in model_state:
+            raise KeyError(f"Local SegFormer key does not exist: {local_key}")
+        if tuple(tensor.shape) != tuple(model_state[local_key].shape):
+            raise ValueError(
+                f"Shape mismatch for {local_key}: checkpoint={tuple(tensor.shape)} "
+                f"model={tuple(model_state[local_key].shape)}"
+            )
+        mapped[local_key] = tensor
+
+    for stage_index, blocks in enumerate(model.blocks):
+        stage = f"stages.{stage_index}"
+        local_stage = f"patch_embeds.{stage_index}"
+        add(f"{local_stage}.proj.weight", f"{stage}.patch_embeddings.proj.weight")
+        add(f"{local_stage}.proj.bias", f"{stage}.patch_embeddings.proj.bias")
+        add(f"{local_stage}.norm.weight", f"{stage}.patch_embeddings.layer_norm.weight")
+        add(f"{local_stage}.norm.bias", f"{stage}.patch_embeddings.layer_norm.bias")
+        for block_index, _ in enumerate(blocks):
+            source_block = f"{stage}.blocks.{block_index}"
+            local_block = f"blocks.{stage_index}.{block_index}"
+            add(f"{local_block}.norm1.weight", f"{source_block}.layernorm_before.weight")
+            add(f"{local_block}.norm1.bias", f"{source_block}.layernorm_before.bias")
+            add(f"{local_block}.attention.query.weight", f"{source_block}.attention.q_proj.weight")
+            add(f"{local_block}.attention.query.bias", f"{source_block}.attention.q_proj.bias")
+            key_weight = torch.cat(
+                [
+                    source_tensor(f"{source_block}.attention.k_proj.weight"),
+                    source_tensor(f"{source_block}.attention.v_proj.weight"),
+                ],
+                dim=0,
+            )
+            key_bias = torch.cat(
+                [
+                    source_tensor(f"{source_block}.attention.k_proj.bias"),
+                    source_tensor(f"{source_block}.attention.v_proj.bias"),
+                ],
+                dim=0,
+            )
+            add(f"{local_block}.attention.key_value.weight", "", key_weight)
+            add(f"{local_block}.attention.key_value.bias", "", key_bias)
+            add(f"{local_block}.attention.projection.weight", f"{source_block}.attention.o_proj.weight")
+            add(f"{local_block}.attention.projection.bias", f"{source_block}.attention.o_proj.bias")
+            if hasattr(model.blocks[stage_index][block_index].attention, "sr"):
+                add(
+                    f"{local_block}.attention.sr.weight",
+                    f"{source_block}.attention.sequence_reduction.sequence_reduction.weight",
+                )
+                add(
+                    f"{local_block}.attention.sr.bias",
+                    f"{source_block}.attention.sequence_reduction.sequence_reduction.bias",
+                )
+                add(
+                    f"{local_block}.attention.sr_norm.weight",
+                    f"{source_block}.attention.sequence_reduction.layer_norm.weight",
+                )
+                add(
+                    f"{local_block}.attention.sr_norm.bias",
+                    f"{source_block}.attention.sequence_reduction.layer_norm.bias",
+                )
+            add(f"{local_block}.norm2.weight", f"{source_block}.layernorm_after.weight")
+            add(f"{local_block}.norm2.bias", f"{source_block}.layernorm_after.bias")
+            add(f"{local_block}.mlp.fc1.weight", f"{source_block}.mlp.fc1.weight")
+            add(f"{local_block}.mlp.fc1.bias", f"{source_block}.mlp.fc1.bias")
+            add(f"{local_block}.mlp.dwconv.weight", f"{source_block}.mlp.dwconv.dwconv.weight")
+            add(f"{local_block}.mlp.dwconv.bias", f"{source_block}.mlp.dwconv.dwconv.bias")
+            add(f"{local_block}.mlp.fc2.weight", f"{source_block}.mlp.fc2.weight")
+            add(f"{local_block}.mlp.fc2.bias", f"{source_block}.mlp.fc2.bias")
+
+    encoder_keys = {
+        key
+        for key in model_state
+        if key.startswith("patch_embeds.") or key.startswith("blocks.")
+    }
+    missing_encoder = sorted(encoder_keys - mapped.keys())
+    if missing_encoder:
+        raise RuntimeError(f"Pretrained SegFormer encoder is incomplete: {missing_encoder[:5]}")
+    model.load_state_dict(mapped, strict=False)
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "loaded_tensor_count": len(mapped),
+        "encoder_tensor_count": len(encoder_keys),
+        "decoder_initialized_from_scratch": True,
+    }
 
 
 def get_segformer_b0(*, pretrained: bool = False, num_classes: int = 2, num_channels: int = 3) -> SegFormerB0ForCloudSegmentation:
