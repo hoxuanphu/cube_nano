@@ -1,0 +1,9 @@
+numpy==2.4.4
+Pillow==11.3.0
+PyYAML==6.0.3
+tifffile==2026.6.1
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
+fastapi==0.136.1
+uvicorn==0.46.0
+websockets==15.0.1

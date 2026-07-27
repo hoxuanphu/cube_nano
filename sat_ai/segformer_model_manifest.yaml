@@ -1,0 +1,86 @@
+schema_version: 2
+model_task: semantic_cloud_segmentation
+model_id: cloud-segformer-b0-rgb
+model_release_id: cloud-segformer-b0-rgb-r1
+checkpoint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+framework: pytorch
+assurance_level: pilot_non_validated
+assurance_profile_id: segformer-b0-rgb-acceptance-v1
+acceptance_profile_id: segformer-b0-rgb-acceptance-v1
+implementation:
+  family: SegFormer-B0
+  implementation_id: mit-b0-all-mlp-v1
+  source: repository-local-src-models-segformer_b0
+  pretrained_artifact_id: mit-b0-imagenet-1k-v1
+  pretrained_artifact_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  license: Apache-2.0
+  dependency_versions:
+    torch: 2.13.0+cpu
+    numpy: 2.4.4
+supported_domains:
+  sensor_ids: []
+  platform_ids: []
+  product_types: []
+  processing_levels: []
+input_spec:
+  input_spec_id: segformer-rgb-dtype-range-v1
+  channels: 3
+  band_order: [red, green, blue]
+  patch_size: 256
+  source_dtype: uint16
+  tensor_dtype: float32
+  tensor_layout: NCHW
+  input_shape: [null, 3, 256, 256]
+  batch_axis: 0
+  normalization:
+    id: segformer-rgb-dtype-range-v1
+    kind: dtype-range
+    integer_scale: 65535
+  padding:
+    id: scene-edge-constant-raw-v1
+    kind: constant
+    value_space: source
+    values: [0, 0, 0]
+output:
+  model_output:
+    kind: semantic_logits
+    name: logits
+    shape: [1, 2, 64, 64]
+    logical_dtype: float32
+    physical_dtype: float32
+    class_axis: 1
+    classes: [clear, cloud]
+    output_stride: 4
+  threshold_mapping_id: logit-bp-f32-lut-v1
+  threshold_lut_sha256: "e4ffc71acb49767c62658b880e1f135d0ce2b0f29ac6b8915d6d16e63111b38c"
+postprocess:
+  postprocess_id: segformer-softmax-bilinear-v1
+  resize:
+    mode: bilinear
+    target: input_spatial_shape
+    align_corners: false
+  probability:
+    kind: softmax
+    cloud_class_index: 1
+  threshold_source: decision_spec.pixel_cloud_probability_threshold_bp
+  invalid_policy: exclude-from-mask-metrics-and-coverage
+product:
+  product_spec_id: semantic-cloud-product-v1
+  cloud_mask:
+    dtype: uint8
+    clear_value: 0
+    cloud_value: 255
+    artifact: cloud_mask.tif
+  validity_mask:
+    dtype: uint8
+    invalid_value: 0
+    valid_value: 1
+    artifact: validity_mask.tif
+decision_spec:
+  decision_spec_id: cloud-segmentation-decision-v1
+  pixel_cloud_probability_threshold_bp: 5000
+  coverage_limit_bp: 6000
+  threshold_selection_metric: validation-false-clear-constrained-dice
+  false_clear_constraint_bp: 500
+  calibration_id: none
+  min_valid_pixel_ratio_bp: 9500

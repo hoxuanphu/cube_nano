@@ -1,0 +1,18 @@
+schema_version: 1
+config_revision: phase6-local-cpu-v1
+benchmark_artifact_id: local-cpu-pytorch-v2
+benchmark_artifact_sha256: 91194d9a78b84115b1931156fbc3d3a79375b60052394103d4c9c0a14fa71b2a
+oldest_ack_age_ms: 1000
+health_max_latency_ms: 2000
+file_min_goodput_bps: 1
+deadline_safety_factor: 4
+watchdog:
+  heartbeat_interval_ms: 1000
+  heartbeat_timeout_ms: 5000
+  max_restarts: 3
+  restart_window_ms: 300000
+queues:
+  max_pending_jobs: 4
+  ack_mailbox_capacity: 32
+  control_queue_capacity: 64
+  file_queue_capacity: 16

@@ -5,6 +5,11 @@ import pycuda.driver as cuda
 import pycuda.autoinit # Automatically initializes CUDA driver
 import time
 
+try:
+    from segformer_engine_contract import SegFormerEngineManifest
+except ModuleNotFoundError:  # Package invocation: import src.inference_tensorrt
+    from src.segformer_engine_contract import SegFormerEngineManifest
+
 # Create a TensorRT logger
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
@@ -188,6 +193,53 @@ class CloudTRTInfer:
         logits = np.clip(logits, -500, 500)
         probs = 1.0 / (1.0 + np.exp(-logits))
         return probs > self.threshold, probs
+
+
+class SegmentationTRTInfer(CloudTRTInfer):
+    """TensorRT adapter for the fixed SegFormer logits output contract."""
+
+    def __init__(self, engine_path, channels=3, patch_size=256, output_shape=(1, 2, 64, 64), manifest_path=None):
+        self.output_shape = tuple(int(value) for value in output_shape)
+        if self.output_shape != (1, 2, 64, 64):
+            raise ValueError("SegFormer TensorRT output contract is fixed at [1, 2, 64, 64]")
+        self.engine_manifest = None
+        if manifest_path is not None:
+            self.engine_manifest = SegFormerEngineManifest.from_file(manifest_path)
+            self.engine_manifest.verify_engine(engine_path)
+        super().__init__(engine_path, channels=channels, patch_size=patch_size, threshold=0.5)
+        output_bindings = [
+            binding for binding in self.engine if not self.engine.binding_is_input(binding)
+        ]
+        if len(output_bindings) != 1:
+            raise ValueError("SegFormer TensorRT engine must have exactly one output binding")
+        actual_shape = tuple(int(value) for value in self.engine.get_binding_shape(output_bindings[0]))
+        if actual_shape != self.output_shape:
+            raise ValueError(
+                f"SegFormer TensorRT output shape {actual_shape} does not match {self.output_shape}"
+            )
+        if self.engine_manifest is not None:
+            if self.engine_manifest.input_shape != self.input_shape:
+                raise ValueError("TensorRT engine input shape does not match engine manifest")
+        self.output_binding = output_bindings[0]
+
+    def infer_logits(self, img_batch):
+        img_batch = self._prepare_input(img_batch)
+        if tuple(img_batch.shape) != self.input_shape:
+            raise ValueError(
+                f"SegFormer TensorRT requires fixed input shape {self.input_shape}, got {img_batch.shape}"
+            )
+        np.copyto(self.inputs[0]['host'], img_batch.ravel())
+        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
+        self.stream.synchronize()
+        values = np.asarray(self.outputs[0]['host'], dtype=np.float32)
+        if values.size != int(np.prod(self.output_shape)):
+            raise ValueError("SegFormer TensorRT output buffer size does not match manifest")
+        return values.reshape(self.output_shape).copy()
+
+
+CloudSegmentationTRTInfer = SegmentationTRTInfer
 
 if __name__ == '__main__':
     # ------------------ TEST ------------------

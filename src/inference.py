@@ -7,7 +7,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.mobilenetv3 import get_cloud_model
+try:
+    from .models.mobilenetv3 import get_cloud_model
+except ImportError:  # Script/test entry points place src directly on sys.path.
+    from models.mobilenetv3 import get_cloud_model
+
+LEGACY_DEV_ONLY = True
 
 
 def normalize_image(image, source="input"):
@@ -45,7 +50,7 @@ def load_image(path):
     return np.asarray(Image.open(path))
 
 
-def prepare_input(image, channels=4, patch_size=256, source="input"):
+def prepare_input(image, channels=3, patch_size=256, source="input"):
     """Normalize, center-crop, and convert one image to a BCHW tensor."""
     image = np.asarray(image)
     if image.ndim == 2:
@@ -143,7 +148,8 @@ def parse_args():
     parser.add_argument(
         "--model-path", default="checkpoints/best_model.pth", help="PyTorch checkpoint"
     )
-    parser.add_argument("--channels", type=int, default=4, choices=(3, 4))
+    parser.add_argument("--channels", type=int, default=3, choices=(3, 4))
+    parser.add_argument("--legacy", action="store_true", help="Explicitly enable the legacy 4-channel development path")
     parser.add_argument("--patch-size", type=int, default=256)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
@@ -159,6 +165,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.channels == 4 and not args.legacy:
+        raise RuntimeError("legacy 4-channel inference requires --legacy")
     if args.patch_size <= 0:
         raise ValueError(f"patch_size must be greater than zero, got {args.patch_size}")
 

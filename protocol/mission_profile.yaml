@@ -1,0 +1,42 @@
+schema_version: 1
+profile_id: local_sil-fprime-v4.1.0-stock-apid
+fprime_version: v4.1.0
+spacecraft_id: 68
+spacecraft_instance_id: "0000000000000001"
+tm_frame_size: 1024
+tc_virtual_channel: 0
+tm_virtual_channel: 0
+byte_order: big
+apids:
+  tc_command: 0
+  tm_telemetry: 1
+  tm_event: 2
+  tm_file: 3
+tm:
+  ocf_present: false
+  fecf_present: true
+  secondary_header_present: false
+buffer_budget:
+  fw_com_buffer_max_size: 512
+  fw_file_buffer_max_size: 1003
+  packet_descriptor_size: 2
+  max_file_data_per_frame: 990
+time:
+  base: tai
+  epoch: "1970-01-01T00:00:00Z"
+  resolution_ns: 1
+scheduler:
+  max_pending_jobs: 4
+  max_in_flight_packets: 1
+  ack_mailbox_capacity: 32
+  control_queue_capacity: 64
+  file_queue_capacity: 16
+  ack_burst: 8
+  control_burst: 4
+  file_burst: 8
+  worker_heartbeat_interval_ms: 1000
+  worker_heartbeat_timeout_ms: 5000
+  max_worker_restarts: 3
+  worker_restart_window_ms: 300000
+  worker_initial_backoff_ms: 250
+  worker_cancel_grace_ms: 1000

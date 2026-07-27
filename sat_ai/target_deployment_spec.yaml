@@ -1,0 +1,13 @@
+target_id: local-cpu-reference-v1
+hardware_sku: x86_64-reference-cpu
+os: Windows-11-or-Linux-reference
+l4t: not-applicable
+cuda: not-applicable
+tensorrt: not-applicable
+precision: float32
+power_mode: host-default-pinned-by-benchmark
+clock_policy: host-default-pinned-by-benchmark
+memory_budget_bytes: 1073741824
+batch_size: 1
+input_shape: [1, 3, 256, 256]
+onnx_opset: 17

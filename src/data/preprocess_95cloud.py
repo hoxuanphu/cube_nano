@@ -28,6 +28,7 @@ BAND_ALIASES = {
     "nir": ("nir", "near_infrared", "nearinfrared"),
     "gt": ("gt", "mask", "masks", "label", "labels", "ground_truth", "groundtruth"),
 }
+KNOWN_GROUND_TRUTH_VALUES = frozenset({0, 1, 255})
 
 
 def _normalized_name(value):
@@ -129,6 +130,29 @@ def _validate_cloud_ratio_threshold(value):
         raise ValueError(f"cloud_ratio_threshold must be between 0 and 1, got {value}")
 
 
+def decode_ground_truth(ground_truth, invalid_values=()):
+    """Decode audited 95-Cloud binary labels without losing invalid pixels."""
+
+    ground_truth = np.asarray(ground_truth)
+    if ground_truth.ndim != 2:
+        raise ValueError(f"ground truth must be a 2D array, got {ground_truth.shape}")
+    if not np.issubdtype(ground_truth.dtype, np.integer) and not np.issubdtype(ground_truth.dtype, np.bool_):
+        raise ValueError(f"ground truth must be integer or boolean, got {ground_truth.dtype}")
+    invalid = {int(value) for value in invalid_values}
+    if any(value < 0 or value > 255 for value in invalid):
+        raise ValueError("invalid ground-truth values must be in [0, 255]")
+    observed = {int(value) for value in np.unique(ground_truth)}
+    unknown = observed - KNOWN_GROUND_TRUTH_VALUES - invalid
+    if unknown:
+        raise ValueError(
+            f"unsupported ground-truth values {sorted(unknown)}; "
+            "audit the encoding before preprocessing"
+        )
+    valid = ~np.isin(ground_truth, tuple(invalid))
+    cloud = valid & np.isin(ground_truth, (1, 255))
+    return cloud.astype(np.uint8), valid.astype(np.uint8)
+
+
 def validate_output_pairs(output_dir):
     """Ensure every processed image has exactly one mask with the same name."""
     output_dir = Path(output_dir)
@@ -161,6 +185,16 @@ def validate_output_pairs(output_dir):
             "Processed image/mask pairing failed: "
             f"missing_masks={missing_masks[:5]}, orphan_masks={orphan_masks[:5]}"
         )
+    validity_dir = output_dir / "validity"
+    if validity_dir.is_dir():
+        validity_names = {path.name for path in validity_dir.glob("*.npy")}
+        missing_validity = sorted(image_name_set - validity_names)
+        orphan_validity = sorted(validity_names - image_name_set)
+        if missing_validity or orphan_validity:
+            raise ValueError(
+                "Processed image/validity pairing failed: "
+                f"missing_validity={missing_validity[:5]}, orphan_validity={orphan_validity[:5]}"
+            )
     if not image_paths:
         raise ValueError(f"No full-size patches were created in {output_dir}")
     return len(image_paths)
@@ -174,10 +208,13 @@ def process_scene(
     cloud_ratio_threshold=0.10,
     channels=4,
     scene_files=None,
+    invalid_ground_truth_values=(),
 ):
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
-    if patch_size <= 0:
+    for directory in ("cloud", "clear", "masks", "validity", "raw_masks"):
+        (output_dir / directory).mkdir(parents=True, exist_ok=True)
+    if patch_size is not None and patch_size <= 0:
         raise ValueError(f"patch_size must be greater than zero, got {patch_size}")
     if channels not in (3, 4):
         raise ValueError(f"channels must be 3 or 4, got {channels}")
@@ -201,18 +238,45 @@ def process_scene(
 
     image = np.stack(arrays, axis=-1)
     height, width = gt.shape
+
+    if patch_size is None:
+        patch_mask, patch_validity = decode_ground_truth(
+            gt,
+            invalid_values=invalid_ground_truth_values,
+        )
+        valid_count = int(np.count_nonzero(patch_validity))
+        cloud_ratio = float(np.count_nonzero(patch_mask)) / valid_count if valid_count else 0.0
+        label = "cloud" if cloud_ratio >= cloud_ratio_threshold else "clear"
+        filename = f"{scene}_p0.npy"
+        np.save(output_dir / label / filename, image)
+        np.save(output_dir / "masks" / filename, patch_mask)
+        np.save(output_dir / "validity" / filename, patch_validity)
+        np.save(output_dir / "raw_masks" / filename, gt)
+        return 1
+
     patch_id = 0
     for row in range(0, height, patch_size):
         for col in range(0, width, patch_size):
             if row + patch_size > height or col + patch_size > width:
                 continue
             patch_gt = gt[row:row + patch_size, col:col + patch_size]
-            patch_mask = (patch_gt > 0).astype(np.uint8)
-            label = "cloud" if np.mean(patch_mask) >= cloud_ratio_threshold else "clear"
+            patch_mask, patch_validity = decode_ground_truth(
+                patch_gt,
+                invalid_values=invalid_ground_truth_values,
+            )
+            valid_count = int(np.count_nonzero(patch_validity))
+            cloud_ratio = (
+                float(np.count_nonzero(patch_mask)) / valid_count
+                if valid_count
+                else 0.0
+            )
+            label = "cloud" if cloud_ratio >= cloud_ratio_threshold else "clear"
             patch = image[row:row + patch_size, col:col + patch_size]
             filename = f"{scene}_p{patch_id}.npy"
             np.save(output_dir / label / filename, patch)
             np.save(output_dir / "masks" / filename, patch_mask)
+            np.save(output_dir / "validity" / filename, patch_validity)
+            np.save(output_dir / "raw_masks" / filename, patch_gt)
             patch_id += 1
     return patch_id
 
@@ -226,6 +290,11 @@ def main():
         help="Source patch size saved for training crops (default: 384)",
     )
     parser.add_argument(
+        "--keep-native-size",
+        action="store_true",
+        help="Save one full-resolution image/mask pair per scene for flexible-size segmentation training",
+    )
+    parser.add_argument(
         "--cloud_ratio_threshold",
         "--threshold",
         dest="cloud_ratio_threshold",
@@ -234,20 +303,29 @@ def main():
         help="Minimum cloud-pixel ratio for a cloud label (default: 0.10)",
     )
     parser.add_argument("--channels", type=int, choices=(3, 4), default=4)
+    parser.add_argument(
+        "--invalid-ground-truth-values",
+        nargs="*",
+        type=int,
+        default=(),
+        help="Explicit raw GT values to exclude; unknown values fail closed",
+    )
     parser.add_argument("--force", action="store_true", help="Delete existing processed .npy files before preprocessing")
     args = parser.parse_args()
 
     if args.patch_size <= 0:
         raise ValueError("patch_size must be greater than zero")
+    if args.keep_native_size and args.channels != 3:
+        raise ValueError("native-size SegFormer preprocessing requires --channels 3")
     _validate_cloud_ratio_threshold(args.cloud_ratio_threshold)
 
     data_dir = Path(args.data_dir)
     output_dir = Path(args.out_dir)
-    for directory in ("cloud", "clear", "masks"):
+    for directory in ("cloud", "clear", "masks", "validity", "raw_masks"):
         (output_dir / directory).mkdir(parents=True, exist_ok=True)
     existing = [
         path
-        for directory in ("cloud", "clear", "masks")
+        for directory in ("cloud", "clear", "masks", "validity", "raw_masks")
         for path in (output_dir / directory).glob("*.npy")
     ]
     if existing and not args.force:
@@ -262,20 +340,23 @@ def main():
     scene_files = discover_scene_files(data_dir, channels=args.channels)
     scenes = sorted(scene_files)
 
+    effective_patch_size = None if args.keep_native_size else args.patch_size
     for scene in tqdm(scenes, desc="95-Cloud"):
         process_scene(
             scene,
             data_dir,
             output_dir,
-            args.patch_size,
+            effective_patch_size,
             args.cloud_ratio_threshold,
             args.channels,
             scene_files[scene],
+            args.invalid_ground_truth_values,
         )
     patch_count = validate_output_pairs(output_dir)
     print(
         f"Preprocessing completed: {len(scenes)} scenes, {patch_count} paired patches "
-        f"(cloud_ratio_threshold={args.cloud_ratio_threshold:.2f}) -> {output_dir}"
+        f"(cloud_ratio_threshold={args.cloud_ratio_threshold:.2f}, "
+        f"source_size={'native' if args.keep_native_size else args.patch_size}) -> {output_dir}"
     )
 
 
