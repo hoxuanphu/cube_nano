@@ -22,7 +22,7 @@ from sat_ai.roi import open_memmap_scene
 from sat_ai.segmentation import cloud_probabilities_from_logits, postprocess_segmentation_logits
 from sat_ai.threshold_lut import ThresholdLUT
 from src.data.preprocess_95cloud import decode_ground_truth, process_scene
-from src.data.segmentation_dataset import SegmentationDataset
+from src.data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
 from src.eval_segmentation import calibrate_validation_predictions, evaluate_loader
 from src.losses import masked_segmentation_loss
 from src.models.segformer_b0 import get_segformer_b0
@@ -294,6 +294,37 @@ def test_native_dataset_and_model_keep_non_square_source_dimensions(tmp_path):
     with torch.inference_mode():
         logits = model(sample["image"].unsqueeze(0))
     assert logits.shape == (1, 2, 75, 95)
+
+
+def test_native_collate_pads_variable_size_samples_and_masks_padding():
+    samples = [
+        {
+            "image": torch.ones((3, 300, 380), dtype=torch.float32),
+            "mask": torch.zeros((300, 380), dtype=torch.long),
+            "validity_mask": torch.ones((300, 380), dtype=torch.bool),
+            "scene_id": "scene_a",
+            "tile_coordinates": (0, 0, 380, 300),
+        },
+        {
+            "image": torch.full((3, 320, 384), 2.0, dtype=torch.float32),
+            "mask": torch.ones((320, 384), dtype=torch.long),
+            "validity_mask": torch.ones((320, 384), dtype=torch.bool),
+            "scene_id": "scene_b",
+            "tile_coordinates": (0, 0, 384, 320),
+        },
+    ]
+
+    batch = collate_segmentation_batch(samples)
+
+    assert batch["image"].shape == (2, 3, 320, 384)
+    assert batch["mask"].shape == (2, 320, 384)
+    assert batch["validity_mask"].shape == (2, 320, 384)
+    assert torch.all(batch["image"][0, :, :300, :380] == 1.0)
+    assert torch.all(batch["mask"][0, 300:, :] == 255)
+    assert not torch.any(batch["validity_mask"][0, 300:, :])
+    assert torch.all(batch["mask"][0, :, 380:] == 255)
+    assert not torch.any(batch["validity_mask"][0, :, 380:])
+    assert batch["scene_id"] == ["scene_a", "scene_b"]
 
 
 def test_native_preprocess_saves_one_full_scene_pair(tmp_path):

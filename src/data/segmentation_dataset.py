@@ -234,3 +234,52 @@ class SegmentationDataset(Dataset):
 
 
 CloudSegmentationDataset = SegmentationDataset
+
+
+def collate_segmentation_batch(
+    samples: list[dict[str, Any]],
+    *,
+    ignore_index: int = 255,
+) -> dict[str, Any]:
+    """Pad native-size samples in a batch and mask the padded pixels out."""
+    if not samples:
+        raise ValueError("cannot collate an empty segmentation batch")
+
+    channels = int(samples[0]["image"].shape[0])
+    max_height = max(int(sample["image"].shape[1]) for sample in samples)
+    max_width = max(int(sample["image"].shape[2]) for sample in samples)
+    image_dtype = samples[0]["image"].dtype
+    image_batch = torch.zeros(
+        (len(samples), channels, max_height, max_width),
+        dtype=image_dtype,
+    )
+    mask_batch = torch.full(
+        (len(samples), max_height, max_width),
+        ignore_index,
+        dtype=torch.long,
+    )
+    validity_batch = torch.zeros(
+        (len(samples), max_height, max_width),
+        dtype=torch.bool,
+    )
+
+    for index, sample in enumerate(samples):
+        image = sample["image"]
+        mask = sample["mask"]
+        validity = sample["validity_mask"].to(torch.bool)
+        height, width = int(image.shape[1]), int(image.shape[2])
+        if image.ndim != 3 or image.shape[0] != channels:
+            raise ValueError("all segmentation images must have the same CHW layout")
+        if mask.shape != (height, width) or validity.shape != (height, width):
+            raise ValueError("segmentation image, mask, and validity shapes must align")
+        image_batch[index, :, :height, :width] = image
+        mask_batch[index, :height, :width] = mask
+        validity_batch[index, :height, :width] = validity
+
+    return {
+        "image": image_batch,
+        "mask": mask_batch,
+        "validity_mask": validity_batch,
+        "scene_id": [sample["scene_id"] for sample in samples],
+        "tile_coordinates": [sample["tile_coordinates"] for sample in samples],
+    }

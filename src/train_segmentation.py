@@ -7,6 +7,7 @@ import json
 import random
 import sys
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(repository_root))
 
 try:
-    from data.segmentation_dataset import SegmentationDataset
+    from data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
     from losses import masked_segmentation_loss
     from models.segformer_b0 import SEGFORMER_IMPLEMENTATION_ID, get_segformer_b0
 except ModuleNotFoundError:  # Package invocation: python -m src.train_segmentation
-    from src.data.segmentation_dataset import SegmentationDataset
+    from src.data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
     from src.losses import masked_segmentation_loss
     from src.models.segformer_b0 import SEGFORMER_IMPLEMENTATION_ID, get_segformer_b0
 
@@ -53,8 +54,6 @@ class SegmentationTrainingConfig:
             raise ValueError("training optimizer settings are invalid")
         if self.ignore_index != 255:
             raise ValueError("ignore_index is pinned to 255")
-        if self.preserve_native_size and self.batch_size != 1:
-            raise ValueError("native-size SegFormer training requires batch_size=1")
 
 
 def set_seed(seed: int) -> None:
@@ -216,8 +215,25 @@ def train(
         is_train=False,
         preserve_native_size=config.preserve_native_size,
     )
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
-    validation_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False, num_workers=0)
+    native_collate = (
+        partial(collate_segmentation_batch, ignore_index=config.ignore_index)
+        if config.preserve_native_size
+        else None
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=native_collate,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=native_collate,
+    )
     model = get_segformer_b0().to(selected_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
