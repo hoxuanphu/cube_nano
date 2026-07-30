@@ -262,6 +262,7 @@ def collate_segmentation_batch(
         (len(samples), max_height, max_width),
         dtype=torch.bool,
     )
+    sample_shapes: list[tuple[int, int]] = []
 
     for index, sample in enumerate(samples):
         image = sample["image"]
@@ -272,6 +273,7 @@ def collate_segmentation_batch(
             raise ValueError("all segmentation images must have the same CHW layout")
         if mask.shape != (height, width) or validity.shape != (height, width):
             raise ValueError("segmentation image, mask, and validity shapes must align")
+        sample_shapes.append((height, width))
         image_batch[index, :, :height, :width] = image
         mask_batch[index, :height, :width] = mask
         validity_batch[index, :height, :width] = validity
@@ -282,4 +284,5 @@ def collate_segmentation_batch(
         "validity_mask": validity_batch,
         "scene_id": [sample["scene_id"] for sample in samples],
         "tile_coordinates": [sample["tile_coordinates"] for sample in samples],
+        "sample_shapes": sample_shapes,
     }

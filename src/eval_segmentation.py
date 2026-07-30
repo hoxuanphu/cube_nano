@@ -66,6 +66,7 @@ def metrics_from_counts(counts: dict[str, int]) -> dict[str, float | int]:
         "cloud_precision": _safe(tp, tp + fp),
         "cloud_recall": _safe(tp, tp + fn),
         "false_clear_rate": _safe(fn, tp + fn),
+        "false_positive_rate": _safe(fp, fp + tn),
         "accuracy": _safe(tp + tn, tp + tn + fp + fn),
     }
 
@@ -109,7 +110,14 @@ def scene_macro_metrics(
                 threshold_bp,
             )
         )
-    keys = ("cloud_iou", "cloud_dice", "cloud_precision", "cloud_recall", "false_clear_rate")
+    keys = (
+        "cloud_iou",
+        "cloud_dice",
+        "cloud_precision",
+        "cloud_recall",
+        "false_clear_rate",
+        "false_positive_rate",
+    )
     result: dict[str, float | int] = {"scene_count": len(reports)}
     for key in keys:
         result[f"macro_{key}"] = float(np.mean([float(report[key]) for report in reports]))
@@ -121,7 +129,7 @@ def select_pixel_threshold(
     target: np.ndarray,
     validity_mask: np.ndarray,
     *,
-    candidates_bp: Iterable[int] = range(1000, 10000, 100),
+    candidates_bp: Iterable[int] = range(0, 10001, 100),
     max_false_clear_rate: float = 0.05,
 ) -> tuple[int, dict[str, float | int]]:
     """Select only from validation predictions, constrained by false-clear."""
@@ -317,6 +325,61 @@ def _coverage_summary(scene_reports: Iterable[dict[str, float | int | str | None
     }
 
 
+def build_error_atlas(
+    evaluation_report: dict,
+    *,
+    top_k: int = 20,
+) -> dict:
+    """Rank validation scenes by the three error modes used in P0 diagnosis."""
+
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    scene_metrics = evaluation_report.get("scene_metrics")
+    if not isinstance(scene_metrics, list) or not scene_metrics:
+        raise ValueError("evaluation report must contain non-empty scene_metrics")
+
+    def rank(
+        metric: str,
+        *,
+        descending: bool,
+        secondary: str,
+    ) -> list[dict]:
+        ordered = sorted(
+            scene_metrics,
+            key=lambda item: (
+                -float(item[metric]) if descending else float(item[metric]),
+                -int(item[secondary]),
+                str(item["scene_id"]),
+            ),
+        )
+        return [dict(item) for item in ordered[:top_k]]
+
+    return {
+        "schema_version": 1,
+        "dataset_role": evaluation_report.get("dataset_role", "validation"),
+        "threshold_bp": int(evaluation_report["threshold_bp"]),
+        "top_k": int(top_k),
+        "scene_count": len(scene_metrics),
+        "rankings": {
+            "highest_false_clear_rate": rank(
+                "false_clear_rate",
+                descending=True,
+                secondary="fn",
+            ),
+            "highest_false_positive_rate": rank(
+                "false_positive_rate",
+                descending=True,
+                secondary="fp",
+            ),
+            "lowest_boundary_f1": rank(
+                "boundary_f1",
+                descending=False,
+                secondary="valid_pixels",
+            ),
+        },
+    }
+
+
 def evaluate_predictions(
     cloud_probability: np.ndarray,
     target: np.ndarray,
@@ -356,6 +419,7 @@ def evaluate_predictions(
         "cloud_precision",
         "cloud_recall",
         "false_clear_rate",
+        "false_positive_rate",
         "boundary_f1",
     )
     return {
@@ -385,22 +449,45 @@ def calibrate_validation_predictions(
     validity_mask: np.ndarray,
     scene_ids: Iterable[str],
     *,
-    candidates_bp: Iterable[int] = range(1000, 10000, 100),
+    candidates_bp: Iterable[int] = range(0, 10001, 100),
     max_false_clear_rate: float = 0.05,
+    refine_step_bp: int | None = None,
     source_pixel_count: int | None = None,
     bootstrap_samples: int = 1000,
     bootstrap_seed: int = 42,
 ) -> dict:
-    """Select a pixel threshold from validation predictions and record the evidence."""
+    """Calibrate on validation with coarse screening and optional local refinement."""
 
-    candidate_values = tuple(int(value) for value in candidates_bp)
-    threshold_bp, selection_metrics = select_pixel_threshold(
+    candidate_values = tuple(sorted({int(value) for value in candidates_bp}))
+    coarse_threshold_bp, coarse_metrics = select_pixel_threshold(
         cloud_probability,
         target,
         validity_mask,
         candidates_bp=candidate_values,
         max_false_clear_rate=max_false_clear_rate,
     )
+    refined_candidates: tuple[int, ...] = ()
+    threshold_bp = coarse_threshold_bp
+    selection_metrics = coarse_metrics
+    if refine_step_bp is not None:
+        if refine_step_bp <= 0 or refine_step_bp > 100:
+            raise ValueError("refine_step_bp must be in [1, 100]")
+        minimum_gap = min(
+            (right - left for left, right in zip(candidate_values, candidate_values[1:])),
+            default=100,
+        )
+        lower = max(0, coarse_threshold_bp - minimum_gap)
+        upper = min(10000, coarse_threshold_bp + minimum_gap)
+        refined_candidates = tuple(range(lower, upper + 1, refine_step_bp))
+        if coarse_threshold_bp not in refined_candidates:
+            refined_candidates = tuple(sorted((*refined_candidates, coarse_threshold_bp)))
+        threshold_bp, selection_metrics = select_pixel_threshold(
+            cloud_probability,
+            target,
+            validity_mask,
+            candidates_bp=refined_candidates,
+            max_false_clear_rate=max_false_clear_rate,
+        )
     report = evaluate_predictions(
         cloud_probability,
         target,
@@ -416,6 +503,11 @@ def calibrate_validation_predictions(
         "selection_metric": "validation-false-clear-constrained-dice",
         "max_false_clear_rate": float(max_false_clear_rate),
         "candidates_bp": list(candidate_values),
+        "coarse_candidates_bp": list(candidate_values),
+        "coarse_threshold_bp": int(coarse_threshold_bp),
+        "coarse_selected_metrics": coarse_metrics,
+        "refine_step_bp": refine_step_bp,
+        "refined_candidates_bp": list(refined_candidates),
         "selected_metrics": selection_metrics,
     }
     return report
@@ -489,8 +581,9 @@ def calibrate_validation_loader(
     loader: DataLoader,
     *,
     device: torch.device,
-    candidates_bp: Iterable[int] = range(1000, 10000, 100),
+    candidates_bp: Iterable[int] = range(0, 10001, 100),
     max_false_clear_rate: float = 0.05,
+    refine_step_bp: int | None = None,
     bootstrap_samples: int = 1000,
     bootstrap_seed: int = 42,
 ) -> dict:
@@ -502,6 +595,7 @@ def calibrate_validation_loader(
         scene_ids,
         candidates_bp=candidates_bp,
         max_false_clear_rate=max_false_clear_rate,
+        refine_step_bp=refine_step_bp,
         source_pixel_count=source_pixel_count,
         bootstrap_samples=bootstrap_samples,
         bootstrap_seed=bootstrap_seed,
@@ -520,9 +614,17 @@ def main() -> None:
         help="Select a pixel threshold from validation predictions; requires --dataset-role validation",
     )
     parser.add_argument("--max-false-clear-rate", type=float, default=0.05)
-    parser.add_argument("--threshold-start-bp", type=int, default=1000)
+    parser.add_argument("--threshold-start-bp", type=int, default=0)
     parser.add_argument("--threshold-stop-bp", type=int, default=10000)
     parser.add_argument("--threshold-step-bp", type=int, default=100)
+    parser.add_argument(
+        "--threshold-refine-step-bp",
+        type=int,
+        default=25,
+        help="Refine around the coarse optimum; set 0 to disable refinement",
+    )
+    parser.add_argument("--error-atlas-output", default=None)
+    parser.add_argument("--error-atlas-top-k", type=int, default=20)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--bootstrap-seed", type=int, default=42)
     parser.add_argument("--device", default=None)
@@ -539,14 +641,22 @@ def main() -> None:
     if args.select_threshold:
         if args.dataset_role != "validation":
             parser.error("--select-threshold requires --dataset-role validation")
-        if args.threshold_step_bp <= 0 or args.threshold_stop_bp <= args.threshold_start_bp:
-            parser.error("threshold sweep requires positive step and stop greater than start")
+        if (
+            args.threshold_step_bp <= 0
+            or args.threshold_start_bp < 0
+            or args.threshold_stop_bp > 10000
+            or args.threshold_stop_bp < args.threshold_start_bp
+        ):
+            parser.error("threshold sweep must be a valid inclusive range in [0, 10000]")
+        if args.threshold_refine_step_bp < 0 or args.threshold_refine_step_bp > 100:
+            parser.error("threshold refinement step must be in [0, 100]")
         report = calibrate_validation_loader(
             model,
             loader,
             device=device,
-            candidates_bp=range(args.threshold_start_bp, args.threshold_stop_bp, args.threshold_step_bp),
+            candidates_bp=range(args.threshold_start_bp, args.threshold_stop_bp + 1, args.threshold_step_bp),
             max_false_clear_rate=args.max_false_clear_rate,
+            refine_step_bp=args.threshold_refine_step_bp or None,
             bootstrap_samples=args.bootstrap_samples,
             bootstrap_seed=args.bootstrap_seed,
         )
@@ -563,6 +673,15 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    if args.error_atlas_output:
+        if args.dataset_role != "validation":
+            parser.error("--error-atlas-output requires --dataset-role validation")
+        error_atlas_output = Path(args.error_atlas_output)
+        error_atlas_output.parent.mkdir(parents=True, exist_ok=True)
+        error_atlas_output.write_text(
+            json.dumps(build_error_atlas(report, top_k=args.error_atlas_top_k), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

@@ -26,6 +26,7 @@ from src.data.segmentation_dataset import SegmentationDataset, collate_segmentat
 from src.eval_segmentation import calibrate_validation_predictions, evaluate_loader
 from src.losses import masked_segmentation_loss
 from src.models.segformer_b0 import get_segformer_b0
+import src.train_segmentation as segmentation_training_module
 from src.train_segmentation import SegmentationTrainingConfig, train_one_epoch
 
 
@@ -198,6 +199,55 @@ def test_train_epoch_accepts_native_size_targets():
     )
     assert metrics["optimizer_steps"] == 1
     assert metrics["valid_pixels"] == 300 * 380
+
+
+def test_train_serializes_path_valued_configuration_in_report(tmp_path, monkeypatch):
+    model = torch.nn.Conv2d(3, 2, kernel_size=1)
+    monkeypatch.setattr(segmentation_training_module, "SegmentationDataset", lambda *args, **kwargs: object())
+    monkeypatch.setattr(segmentation_training_module, "DataLoader", lambda *args, **kwargs: [])
+    monkeypatch.setattr(segmentation_training_module, "get_segformer_b0", lambda: model)
+    monkeypatch.setattr(
+        segmentation_training_module,
+        "load_segformer_mit_b0_encoder",
+        lambda *args, **kwargs: {"status": "loaded"},
+    )
+    monkeypatch.setattr(
+        segmentation_training_module,
+        "train_one_epoch",
+        lambda *args, **kwargs: {
+            "loss": 0.25,
+            "valid_pixels": 4,
+            "optimizer_steps": 1,
+            "skipped_all_invalid_batches": 0,
+        },
+    )
+    monkeypatch.setattr(
+        segmentation_training_module,
+        "evaluate_loss",
+        lambda *args, **kwargs: {
+            "loss": 0.125,
+            "valid_pixels": 4,
+            "skipped_all_invalid_batches": 0,
+        },
+    )
+
+    encoder_path = tmp_path / "mit_b0_encoder.pth"
+    output_path = tmp_path / "segformer.pth"
+    report = segmentation_training_module.train(
+        tmp_path / "train",
+        tmp_path / "validation",
+        output_path,
+        config=SegmentationTrainingConfig(
+            epochs=1,
+            use_amp=False,
+            pretrained_encoder_path=encoder_path,
+        ),
+        device="cpu",
+    )
+
+    assert report["training_config"]["pretrained_encoder_path"] == str(encoder_path)
+    persisted_report = json.loads(output_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert persisted_report["training_config"]["pretrained_encoder_path"] == str(encoder_path)
 
 
 def test_segmentation_runtime_stitches_edge_and_uses_valid_pixel_denominator(tmp_path):
