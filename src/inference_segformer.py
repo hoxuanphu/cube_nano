@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 import torch
@@ -41,7 +41,14 @@ def _resolve_device(device: str) -> torch.device:
 
 
 def _load_state_dict(checkpoint_path: Path) -> dict[str, torch.Tensor]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # PyTorch 2.6+ defaults to weights_only=True. Some training metadata
+    # contains pathlib.PosixPath, which cannot be instantiated on Windows.
+    # It is metadata only, so deserialize it as the platform-neutral equivalent
+    # without weakening the restricted unpickler for arbitrary classes.
+    with torch.serialization.safe_globals(
+        [(PurePosixPath, "pathlib.PosixPath")]
+    ):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(checkpoint, dict):
         checkpoint = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint))
     if not isinstance(checkpoint, dict):
