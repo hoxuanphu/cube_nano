@@ -1,0 +1,24 @@
+{
+  "ablation_seeds": [42, 123, 456],
+  "ablation_weights": [1.0, 1.2, 1.5, 2.0, 3.0],
+  "class_mapping": {"cloud": 1, "ignore_index": 255, "surface": 0},
+  "evaluation_contract": {
+    "calibrated_threshold_bp": 2100,
+    "paired_scene_count": 2,
+    "status": "PASS"
+  },
+  "fixed_loss_config": {"cross_entropy_weight": 1.0, "dice_weight": 1.0},
+  "loss_contract": {
+    "checks": "weighted, ignore, validity, all-invalid, backward, baseline",
+    "status": "PASS"
+  },
+  "pytest_status": "not installed; equivalent assertions executed by this verifier",
+  "runtime": {
+    "numpy": "2.5.1",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.4",
+    "torch": "2.13.0+cpu"
+  },
+  "schema_version": 1,
+  "status": "PASS"
+}

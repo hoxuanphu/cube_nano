@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -49,6 +50,7 @@ class SegmentationTrainingConfig:
     lr_plateau_factor: float = 0.5
     min_learning_rate: float = 1e-7
     early_stopping_patience: int = 12
+    cloud_class_weight: float = 1.0
     cross_entropy_weight: float = 1.0
     dice_weight: float = 1.0
     dice_epsilon: float = 1e-6
@@ -66,6 +68,16 @@ class SegmentationTrainingConfig:
             raise ValueError("learning-rate plateau settings are invalid")
         if self.learning_rate <= 0 or self.weight_decay < 0:
             raise ValueError("training optimizer settings are invalid")
+        if not np.isfinite(self.cloud_class_weight) or self.cloud_class_weight <= 0:
+            raise ValueError("cloud_class_weight must be finite and positive")
+        if not np.isfinite(self.cross_entropy_weight) or not np.isfinite(self.dice_weight):
+            raise ValueError("loss weights must be finite")
+        if self.cross_entropy_weight < 0 or self.dice_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        if self.cross_entropy_weight + self.dice_weight <= 0:
+            raise ValueError("loss weights must not both be zero")
+        if not np.isfinite(self.dice_epsilon) or self.dice_epsilon <= 0:
+            raise ValueError("dice_epsilon must be finite and positive")
         if self.min_learning_rate < 0 or self.min_learning_rate >= self.learning_rate:
             raise ValueError("minimum learning rate must be non-negative and below the initial rate")
         if self.ignore_index != 255:
@@ -81,6 +93,21 @@ def set_seed(seed: int) -> None:
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+
+
+def _git_commit() -> str:
+    """Return the source revision without making training depend on Git."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
 
 
 def _batch_valid_count(batch: dict[str, torch.Tensor], ignore_index: int) -> int:
@@ -100,6 +127,8 @@ def train_one_epoch(
 ) -> dict[str, float | int]:
     model.train()
     total_loss = 0.0
+    total_cross_entropy = 0.0
+    total_soft_dice = 0.0
     total_valid = 0
     optimizer_steps = 0
     skipped_invalid = 0
@@ -115,11 +144,12 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             logits = model(images)
-            loss, _ = masked_segmentation_loss(
+            loss, parts = masked_segmentation_loss(
                 logits,
                 targets,
                 validity_mask=validity,
                 ignore_index=config.ignore_index,
+                cloud_class_weight=config.cloud_class_weight,
                 cross_entropy_weight=config.cross_entropy_weight,
                 dice_weight=config.dice_weight,
                 epsilon=config.dice_epsilon,
@@ -134,10 +164,14 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
         total_loss += float(loss.detach().cpu()) * valid_count
+        total_cross_entropy += float(parts["cross_entropy"].detach().cpu()) * valid_count
+        total_soft_dice += float(parts["soft_dice"].detach().cpu()) * valid_count
         total_valid += valid_count
         optimizer_steps += 1
     return {
         "loss": total_loss / max(total_valid, 1),
+        "cross_entropy": total_cross_entropy / max(total_valid, 1),
+        "soft_dice": total_soft_dice / max(total_valid, 1),
         "valid_pixels": total_valid,
         "optimizer_steps": optimizer_steps,
         "skipped_all_invalid_batches": skipped_invalid,
@@ -153,6 +187,8 @@ def evaluate_loss(
 ) -> dict[str, float | int]:
     model.eval()
     total_loss = 0.0
+    total_cross_entropy = 0.0
+    total_soft_dice = 0.0
     total_valid = 0
     skipped_invalid = 0
     for batch in loader:
@@ -164,19 +200,24 @@ def evaluate_loss(
         targets = batch["mask"].to(device, non_blocking=True)
         validity = batch["validity_mask"].to(device, non_blocking=True)
         logits = model(images)
-        loss, _ = masked_segmentation_loss(
+        loss, parts = masked_segmentation_loss(
             logits,
             targets,
             validity_mask=validity,
             ignore_index=config.ignore_index,
+            cloud_class_weight=config.cloud_class_weight,
             cross_entropy_weight=config.cross_entropy_weight,
             dice_weight=config.dice_weight,
             epsilon=config.dice_epsilon,
         )
         total_loss += float(loss.cpu()) * valid_count
+        total_cross_entropy += float(parts["cross_entropy"].cpu()) * valid_count
+        total_soft_dice += float(parts["soft_dice"].cpu()) * valid_count
         total_valid += valid_count
     return {
         "loss": total_loss / max(total_valid, 1),
+        "cross_entropy": total_cross_entropy / max(total_valid, 1),
+        "soft_dice": total_soft_dice / max(total_valid, 1),
         "valid_pixels": total_valid,
         "skipped_all_invalid_batches": skipped_invalid,
     }
@@ -219,6 +260,22 @@ def train(
 ) -> dict[str, Any]:
     config = config or SegmentationTrainingConfig()
     config.validate()
+    metadata_payload = dict(metadata or {})
+    metadata_payload.setdefault("git_commit", _git_commit())
+    metadata_payload.setdefault(
+        "class_mapping",
+        {"surface": 0, "cloud": 1, "ignore_index": config.ignore_index},
+    )
+    metadata_payload.setdefault(
+        "loss_config",
+        {
+            "cloud_class_weight": config.cloud_class_weight,
+            "cross_entropy_weight": config.cross_entropy_weight,
+            "dice_weight": config.dice_weight,
+            "dice_epsilon": config.dice_epsilon,
+            "ignore_index": config.ignore_index,
+        },
+    )
     set_seed(config.seed)
     selected_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     train_dataset = SegmentationDataset(
@@ -299,7 +356,7 @@ def train(
                 global_step=global_step,
                 best_metric=-best_loss,
                 config=config,
-                metadata=metadata or {},
+                metadata=metadata_payload,
             )
         else:
             stale_epochs += 1
@@ -315,7 +372,7 @@ def train(
         "checkpoint_path": str(output),
         "best_validation_loss": best_loss,
         "history": history,
-        "metadata": metadata or {},
+        "metadata": metadata_payload,
         "training_config": asdict(config),
         "pretrained_encoder": pretrained_report,
     }
@@ -327,12 +384,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the SegFormer-B0 cloud segmenter")
     parser.add_argument("--train-dir", required=True)
     parser.add_argument("--validation-dir", required=True)
-    parser.add_argument("--output", default="checkpoints/segformer_b0_rgb_r1.pth")
+    parser.add_argument("--output", default="checkpoint/segformer_b0_rgb_research_baseline.pth")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=6e-5)
     parser.add_argument("--lr-plateau-patience", type=int, default=5)
     parser.add_argument("--lr-plateau-factor", type=float, default=0.5)
     parser.add_argument("--min-learning-rate", type=float, default=1e-7)
+    parser.add_argument("--cloud-class-weight", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--tile-training",
@@ -352,6 +410,7 @@ def main() -> None:
             lr_plateau_patience=args.lr_plateau_patience,
             lr_plateau_factor=args.lr_plateau_factor,
             min_learning_rate=args.min_learning_rate,
+            cloud_class_weight=args.cloud_class_weight,
             batch_size=args.batch_size,
             seed=args.seed,
             preserve_native_size=not args.tile_training,

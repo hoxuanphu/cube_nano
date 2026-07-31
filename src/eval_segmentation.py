@@ -241,6 +241,41 @@ def bootstrap_scene_metric(values: Iterable[float], *, samples: int = 1000, seed
     }
 
 
+def bootstrap_paired_scene_metric(
+    left: dict[str, float],
+    right: dict[str, float],
+    *,
+    samples: int = 1000,
+    seed: int = 42,
+) -> dict[str, float | int]:
+    """Bootstrap paired per-scene differences for two validation reports."""
+
+    if (
+        not left
+        or not right
+        or set(left) != set(right)
+        or samples <= 0
+        or not all(np.isfinite(float(value)) for value in (*left.values(), *right.values()))
+    ):
+        raise ValueError("paired bootstrap inputs must share non-empty scene IDs")
+    scene_ids = tuple(sorted(left))
+    differences = np.asarray(
+        [float(right[scene_id]) - float(left[scene_id]) for scene_id in scene_ids],
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(seed)
+    sample_indices = rng.integers(0, len(differences), size=(samples, len(differences)))
+    means = differences[sample_indices].mean(axis=1)
+    return {
+        "scene_count": int(len(differences)),
+        "samples": int(samples),
+        "seed": int(seed),
+        "mean_difference": float(differences.mean()),
+        "lower_95": float(np.percentile(means, 2.5)),
+        "upper_95": float(np.percentile(means, 97.5)),
+    }
+
+
 def _group_scene_indices(scene_ids: Iterable[str], expected_count: int) -> dict[str, list[int]]:
     values = tuple(str(value) for value in scene_ids)
     if len(values) != expected_count:

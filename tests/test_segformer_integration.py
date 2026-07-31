@@ -23,8 +23,12 @@ from sat_ai.segmentation import cloud_probabilities_from_logits, postprocess_seg
 from sat_ai.threshold_lut import ThresholdLUT
 from src.data.preprocess_95cloud import decode_ground_truth, process_scene
 from src.data.segmentation_dataset import SegmentationDataset, collate_segmentation_batch
-from src.eval_segmentation import calibrate_validation_predictions, evaluate_loader
-from src.losses import masked_segmentation_loss
+from src.eval_segmentation import (
+    bootstrap_paired_scene_metric,
+    calibrate_validation_predictions,
+    evaluate_loader,
+)
+from src.losses import masked_segmentation_loss, soft_dice_loss
 from src.models.segformer_b0 import get_segformer_b0
 from src.train_segmentation import SegmentationTrainingConfig, train_one_epoch
 
@@ -168,6 +172,72 @@ def test_cross_entropy_excludes_pixels_marked_invalid_by_validity_mask():
         dice_weight=0.0,
     )
     assert torch.equal(clear_loss, cloud_loss)
+
+
+def test_target_ignore_index_does_not_change_cross_entropy():
+    logits = torch.tensor([[[[3.0, -2.0]], [[-3.0, 2.0]]]])
+    ignored = torch.tensor([[[255, 1]]])
+    changed = torch.tensor([[[0, 1]]])
+    ignored_loss, _ = masked_segmentation_loss(logits, ignored, dice_weight=0.0)
+    changed_loss, _ = masked_segmentation_loss(logits, changed, dice_weight=0.0)
+    torch.testing.assert_close(ignored_loss, changed_loss)
+
+
+def test_weighted_loss_penalizes_cloud_miss_in_mixed_batch():
+    logits = torch.tensor([[[[5.0, 5.0]], [[-5.0, -5.0]]]])
+    target = torch.tensor([[[1, 0]]], dtype=torch.long)
+    validity = torch.ones_like(target, dtype=torch.bool)
+
+    baseline, _ = masked_segmentation_loss(
+        logits,
+        target,
+        validity_mask=validity,
+        cloud_class_weight=1.0,
+        dice_weight=0.0,
+    )
+    weighted, _ = masked_segmentation_loss(
+        logits,
+        target,
+        validity_mask=validity,
+        cloud_class_weight=2.0,
+        dice_weight=0.0,
+    )
+
+    assert float(weighted) > float(baseline)
+
+
+def test_weight_one_is_compatible_with_unweighted_baseline():
+    logits = torch.tensor([[[[1.0, -1.0]], [[-1.0, 1.0]]]], requires_grad=True)
+    target = torch.tensor([[[0, 1]]], dtype=torch.long)
+    validity = torch.ones_like(target, dtype=torch.bool)
+    actual, _ = masked_segmentation_loss(logits, target, validity_mask=validity)
+    expected = torch.nn.functional.cross_entropy(logits, target) + soft_dice_loss(
+        logits,
+        target,
+        validity_mask=validity,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_paired_scene_bootstrap_requires_shared_scene_ids_and_reports_difference():
+    result = bootstrap_paired_scene_metric(
+        {"scene-a": 0.5, "scene-b": 0.7},
+        {"scene-a": 0.6, "scene-b": 0.8},
+        samples=100,
+        seed=42,
+    )
+    assert result["scene_count"] == 2
+    assert result["mean_difference"] == pytest.approx(0.1)
+    with pytest.raises(ValueError, match="scene IDs"):
+        bootstrap_paired_scene_metric({"scene-a": 0.5}, {"scene-b": 0.6})
+
+
+@pytest.mark.parametrize("weight", (0.0, -1.0, float("nan"), float("inf")))
+def test_cloud_class_weight_must_be_finite_and_positive(weight):
+    logits = torch.zeros((1, 2, 2, 2), requires_grad=True)
+    target = torch.zeros((1, 2, 2), dtype=torch.long)
+    with pytest.raises(ValueError, match="cloud_class_weight"):
+        masked_segmentation_loss(logits, target, cloud_class_weight=weight)
 
 
 def test_masked_loss_upsamples_logits_to_native_target_size():

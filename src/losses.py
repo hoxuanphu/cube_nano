@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -39,8 +41,8 @@ def soft_dice_loss(
     """Cloud-class soft Dice over valid pixels in the whole mini-batch."""
 
     logits = resize_logits_to_target(logits, target)
-    if epsilon <= 0:
-        raise ValueError("epsilon must be positive")
+    if not math.isfinite(float(epsilon)) or epsilon <= 0:
+        raise ValueError("epsilon must be finite and positive")
     valid = _valid_pixels(target, validity_mask, ignore_index)
     if not torch.any(valid):
         return logits.sum() * 0.0
@@ -61,6 +63,7 @@ def masked_segmentation_loss(
     *,
     validity_mask: Tensor | None = None,
     ignore_index: int = 255,
+    cloud_class_weight: float = 1.0,
     cross_entropy_weight: float = 1.0,
     dice_weight: float = 1.0,
     epsilon: float = 1e-6,
@@ -69,7 +72,15 @@ def masked_segmentation_loss(
 
     logits = resize_logits_to_target(logits, target)
     valid = _valid_pixels(target, validity_mask, ignore_index)
-    if cross_entropy_weight < 0 or dice_weight < 0 or cross_entropy_weight + dice_weight <= 0:
+    if not math.isfinite(float(cloud_class_weight)) or cloud_class_weight <= 0:
+        raise ValueError("cloud_class_weight must be finite and positive")
+    if (
+        not math.isfinite(float(cross_entropy_weight))
+        or not math.isfinite(float(dice_weight))
+        or cross_entropy_weight < 0
+        or dice_weight < 0
+        or cross_entropy_weight + dice_weight <= 0
+    ):
         raise ValueError("loss weights must be non-negative and not both zero")
     if torch.any(valid):
         cross_entropy_target = torch.where(
@@ -77,7 +88,17 @@ def masked_segmentation_loss(
             target,
             torch.full_like(target, ignore_index),
         )
-        cross_entropy = F.cross_entropy(logits, cross_entropy_target, ignore_index=ignore_index)
+        class_weight = torch.tensor(
+            [1.0, cloud_class_weight],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        cross_entropy = F.cross_entropy(
+            logits,
+            cross_entropy_target,
+            weight=class_weight,
+            ignore_index=ignore_index,
+        )
     else:
         cross_entropy = logits.sum() * 0.0
     dice = soft_dice_loss(

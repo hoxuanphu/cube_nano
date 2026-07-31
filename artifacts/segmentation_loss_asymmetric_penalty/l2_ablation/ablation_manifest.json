@@ -1,0 +1,40 @@
+{
+  "acceptance_criteria": {
+    "max_coverage_mae_bp": 500,
+    "max_coverage_p95_abs_error_bp": 1000,
+    "max_false_clear_rate": 0.05,
+    "min_cloud_dice": 0.85,
+    "min_cloud_iou": 0.75,
+    "min_cloud_recall": 0.9,
+    "pending_stakeholder_approval": {
+      "max_cloud_dice_drop_vs_baseline": null,
+      "min_cloud_precision": null
+    },
+    "profile_id": "segformer-b0-rgb-acceptance-v1",
+    "selection_priority": [
+      "cloud_recall",
+      "false_clear_rate",
+      "lower_weight_if_indistinguishable"
+    ],
+    "source": "sat_ai/acceptance_profile.yaml; precision and relative-Dice limits remain unapproved"
+  },
+  "blocker": {
+    "condition_to_unlock": "provide frozen processed train/validation segmentation directories",
+    "message": "no processed RGB patches found under data\\processed\\train",
+    "type": "ValueError"
+  },
+  "experiment_id": "segmentation-asymmetric-penalty-v1",
+  "fixed_loss_config": {"cross_entropy_weight": 1.0, "dice_weight": 1.0},
+  "git_commit": "05168ff97f904072ffdca622fa530a4ce9d25f87",
+  "runs": [],
+  "runtime": {
+    "numpy": "2.5.1",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.4",
+    "torch": "2.13.0+cpu"
+  },
+  "schema_version": 1,
+  "seeds": [42, 123, 456],
+  "status": "BLOCKED",
+  "weights": [1.0, 1.2, 1.5, 2.0, 3.0]
+}
