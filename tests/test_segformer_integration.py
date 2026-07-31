@@ -174,13 +174,14 @@ def test_cross_entropy_excludes_pixels_marked_invalid_by_validity_mask():
     assert torch.equal(clear_loss, cloud_loss)
 
 
-def test_target_ignore_index_does_not_change_cross_entropy():
+def test_target_ignore_index_excludes_pixel_from_cross_entropy():
     logits = torch.tensor([[[[3.0, -2.0]], [[-3.0, 2.0]]]])
     ignored = torch.tensor([[[255, 1]]])
-    changed = torch.tensor([[[0, 1]]])
+    altered_logits = logits.clone()
+    altered_logits[0, :, 0, 0] = torch.tensor([-100.0, 100.0])
     ignored_loss, _ = masked_segmentation_loss(logits, ignored, dice_weight=0.0)
-    changed_loss, _ = masked_segmentation_loss(logits, changed, dice_weight=0.0)
-    torch.testing.assert_close(ignored_loss, changed_loss)
+    altered_loss, _ = masked_segmentation_loss(altered_logits, ignored, dice_weight=0.0)
+    torch.testing.assert_close(ignored_loss, altered_loss)
 
 
 def test_weighted_loss_penalizes_cloud_miss_in_mixed_batch():
