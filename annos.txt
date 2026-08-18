@@ -1,0 +1,50 @@
+A bit mask for selecting the type of processing to perform on a container before writing it to disk.
+A command to enable or disable Event verbosity and Telemetry
+A command to enable or disable health checks
+A frame was detected whose size exceeds the internal accumulation buffer capacity. No choice but to drop the frame.
+APIDs are 11 bits in the Space Packet protocol, so we use U16. Max value 7FF
+An allocation error occurred
+An assert happened
+An enumeration for Version Type
+An enumeration for version status
+An enumeration of queue data types
+An error occurred while attempting to set the current time
+An error occurred while deserializing a packet
+An error occurred while serializing a com buffer
+An unexpected assert happened
+Anything equal or higher value is invalid and should not be used
+Arg1
+Arg2
+Arg3
+Array of queue depths for Fw::Buffer types
+Array of queue depths for Fw::Com types
+Attempted to add ID to full ID filter ID
+Buffer allocation for file uplink
+Buffer allocation for user handled buffer
+Change ping value
+Clear command tracking info to recover from components not returning status
+Command failed to deserialize
+Command failed validation
+Command had execution error
+Command packet type - incoming
+Command successfully executed
+Component busy
+Couldn't find the packet to send
+Count of number of cycles
+Custom Versions
+Data Product packet type
+Data Structure for custom version Tlm
+Data was left in in the buffer, but not enough to deserialize
+Declare FATAL since task is no longer responding
+Define a set of Version entries on a project-specific basis.
+Define enumeration for Time base types
+Deframing received an invalid SCID
+Deframing received an invalid VCID
+Deframing received an invalid checksum
+Deframing received an invalid frame length
+Deframing received an unexpected sequence count
+Depth of queues of Fw::Buffer type
+Depth of queues of Fw::ComBuffer type
+Deserialization buffer was empty when trying to read data
+Deserialization data had incorrect values (unexpected data types)
+Deserialization status
