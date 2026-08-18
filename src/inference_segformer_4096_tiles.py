@@ -48,10 +48,13 @@ from resource_guards import (  # noqa: E402
     require_disk_allocations,
     require_writable_parents,
 )
+from tiff_reader import close_memmap  # noqa: E402
+from power_monitor import PowerSampler  # noqa: E402
 
 
 RESIZED_IMAGE_SIZE = 4096
 TILE_SIZE = 1024
+DEFAULT_CONTEXT_SIZE = 256
 OUTPUT_MODE_MERGED = "merged"
 OUTPUT_MODE_TILES = "tiles"
 OUTPUT_MODES = (OUTPUT_MODE_MERGED, OUTPUT_MODE_TILES)
@@ -139,6 +142,132 @@ def _read_resized_strip(
     return strip
 
 
+def _pad_context_strip(
+    strip: np.ndarray,
+    *,
+    requested_start: int,
+    requested_end: int,
+    actual_start: int,
+    actual_end: int,
+) -> np.ndarray:
+    """Replicate the resized image edge when a context window crosses it."""
+    pad_before = actual_start - requested_start
+    pad_after = requested_end - actual_end
+    if pad_before < 0 or pad_after < 0:
+        raise ValueError("actual strip bounds must be inside requested bounds")
+    if pad_before == 0 and pad_after == 0:
+        return strip
+    if strip.shape[0] == 0 or strip.shape[1] == 0:
+        raise ValueError("cannot pad an empty resized strip")
+    return np.pad(
+        strip,
+        ((pad_before, pad_after), (0, 0), (0, 0)),
+        mode="edge",
+    )
+
+
+def _extract_context_patch(
+    resized_strip: np.ndarray,
+    *,
+    column_start: int,
+    tile_size: int,
+    context_size: int,
+    image_width: int,
+) -> np.ndarray:
+    """Extract one fixed-size HWC patch, padding only outside the image edge."""
+    requested_start = column_start - context_size
+    requested_end = column_start + tile_size + context_size
+    actual_start = max(requested_start, 0)
+    actual_end = min(requested_end, image_width)
+    patch = resized_strip[:, actual_start:actual_end, :]
+    pad_before = actual_start - requested_start
+    pad_after = requested_end - actual_end
+    if pad_before == 0 and pad_after == 0:
+        return patch
+    if patch.shape[0] == 0 or patch.shape[1] == 0:
+        raise ValueError("cannot extract context from an empty resized strip")
+    return np.pad(
+        patch,
+        ((0, 0), (pad_before, pad_after), (0, 0)),
+        mode="edge",
+    )
+
+
+class _StagedResizedImageOutput:
+    """Write a resized RGB TIFF atomically through a disk-backed array."""
+
+    def __init__(self, destination: Path, shape: tuple[int, int, int], dtype: np.dtype) -> None:
+        self.destination = destination
+        self.shape = shape
+        self.dtype = np.dtype(dtype)
+        self.temporary_path: Path | None = None
+        self.array: np.memmap | None = None
+        self._committed = False
+
+    @property
+    def nbytes(self) -> int:
+        return int(np.prod(self.shape, dtype=np.int64)) * self.dtype.itemsize
+
+    def open(self) -> np.memmap:
+        if self.array is not None:
+            return self.array
+        try:
+            import tifffile
+        except ImportError as exc:
+            raise ImportError("Writing TIFF output requires tifffile") from exc
+
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.destination.name}.",
+            suffix=".tmp",
+            dir=self.destination.parent,
+        )
+        os.close(descriptor)
+        self.temporary_path = Path(temporary_name)
+        self.temporary_path.unlink()
+        try:
+            self.array = tifffile.memmap(
+                self.temporary_path,
+                shape=self.shape,
+                dtype=self.dtype,
+                mode="w+",
+                photometric="rgb",
+                metadata={"axes": "YXS"},
+            )
+        except Exception:
+            self.temporary_path.unlink(missing_ok=True)
+            self.temporary_path = None
+            raise
+        return self.array
+
+    def close(self) -> None:
+        if self.array is not None:
+            close_memmap(self.array)
+            self.array = None
+
+    def commit(self) -> None:
+        if self.temporary_path is None:
+            raise RuntimeError("Output has not been opened")
+        self.close()
+        os.replace(self.temporary_path, self.destination)
+        self._committed = True
+        self.temporary_path = None
+
+    def abort(self) -> None:
+        self.close()
+        if not self._committed and self.temporary_path is not None:
+            self.temporary_path.unlink(missing_ok=True)
+            self.temporary_path = None
+
+
+def _cast_resized_strip(strip: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Convert interpolated values back to the source image storage dtype."""
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return np.rint(np.clip(strip, info.min, info.max)).astype(dtype)
+    return strip.astype(dtype, copy=False)
+
+
 def _write_tiff_atomically(destination: Path, array: np.ndarray) -> None:
     """Write a small mask tile through a same-filesystem temporary TIFF."""
     try:
@@ -212,6 +341,7 @@ def infer_resized_4096_tiles(
     output_mode: str = OUTPUT_MODE_MERGED,
     output_mask: str | Path | None = None,
     output_dir: str | Path | None = None,
+    output_resized_image: str | Path | None = None,
     batch_size: int = 1,
     threshold: float = 0.5,
     device: str = "auto",
@@ -228,13 +358,19 @@ def infer_resized_4096_tiles(
     progress_every: int = 1,
     resize_size: int = RESIZED_IMAGE_SIZE,
     tile_size: int = TILE_SIZE,
+    context_size: int = DEFAULT_CONTEXT_SIZE,
+    power_sensor: str | Path | None = None,
+    power_sample_interval: float = 0.1,
+    power_unit: str = "uw",
     _filesystem_provider=None,
 ) -> dict[str, object]:
-    """Resize an RGB image and run non-overlapping tiled SegFormer inference.
+    """Resize an RGB image and infer tiles with context-only overlap.
 
     The command-line entry point intentionally uses the required 4096 x 4096
-    and 1024 x 1024 geometry. ``resize_size`` and ``tile_size`` are kept as
-    keyword arguments to make the resampling implementation testable.
+    and 1024 x 1024 geometry. Each model input includes ``context_size``
+    pixels around its output tile, but only the central tile is written.
+    ``resize_size`` and ``tile_size`` are kept as keyword arguments to make
+    the resampling implementation testable.
     """
     if resize_size <= 0:
         raise ValueError("resize_size must be positive")
@@ -242,10 +378,16 @@ def infer_resized_4096_tiles(
         raise ValueError("tile_size must be positive and divide resize_size exactly")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if context_size < 0:
+        raise ValueError("context_size must be non-negative")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be between 0 and 1")
     if progress_every <= 0:
         raise ValueError("progress_every must be positive")
+    if power_sample_interval <= 0:
+        raise ValueError("power_sample_interval must be positive")
+
+    model_tile_size = tile_size + 2 * context_size
 
     image_path = Path(image_path)
     checkpoint_path = Path(checkpoint_path)
@@ -255,6 +397,14 @@ def infer_resized_4096_tiles(
         output_mask,
         output_dir,
     )
+    resized_image_path = (
+        Path(output_resized_image) if output_resized_image is not None else None
+    )
+    if resized_image_path is not None:
+        if resized_image_path.suffix.lower() not in TIFF_EXTENSIONS:
+            raise ValueError("output_resized_image must use a .tif or .tiff extension")
+        if resized_image_path.resolve(strict=False) == image_path.resolve(strict=False):
+            raise ValueError("output_resized_image must not overwrite the input image")
     source_height, source_width, channels = _probe_image_shape(image_path)
     if channels != MODEL_CHANNELS:
         raise ValueError(f"Expected 3 RGB channels, got {channels}")
@@ -280,6 +430,14 @@ def infer_resized_4096_tiles(
             DiskAllocation(path, tile_mask_bytes, "individual 1024 SegFormer mask tile")
             for path in output_tile_paths.values()
         ]
+    if resized_image_path is not None:
+        output_allocations.append(
+            DiskAllocation(
+                resized_image_path,
+                resize_size * resize_size * channels * np.dtype(np.float32).itemsize,
+                "resized RGB comparison TIFF",
+            )
+        )
     require_writable_parents(output_allocations)
     require_disk_allocations(output_allocations, provider=_filesystem_provider)
 
@@ -296,7 +454,7 @@ def infer_resized_4096_tiles(
 
     reader = _open_reader(
         image_path,
-        tile_size=tile_size,
+        tile_size=model_tile_size,
         batch_size=batch_size,
         tiff_read_mode=tiff_read_mode,
         tiff_cache_mode=tiff_cache_mode,
@@ -327,12 +485,35 @@ def infer_resized_4096_tiles(
             if output_mask_path is not None
             else None
         )
+        resized_image_stage = None
+        resized_image = None
+        if resized_image_path is not None:
+            resized_dtype = (
+                np.dtype(reader.dtype)
+                if np.issubdtype(reader.dtype, np.integer)
+                else np.dtype(np.float32)
+            )
+            resized_image_stage = _StagedResizedImageOutput(
+                resized_image_path,
+                (resize_size, resize_size, channels),
+                resized_dtype,
+            )
         merged_mask = None
         if mask_stage is not None:
             try:
                 merged_mask = mask_stage.open()
+                if resized_image_stage is not None:
+                    resized_image = resized_image_stage.open()
             except Exception:
                 mask_stage.abort()
+                if resized_image_stage is not None:
+                    resized_image_stage.abort()
+                raise
+        elif resized_image_stage is not None:
+            try:
+                resized_image = resized_image_stage.open()
+            except Exception:
+                resized_image_stage.abort()
                 raise
         elif output_dir_path is not None:
             output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -342,14 +523,24 @@ def infer_resized_4096_tiles(
         processed_tiles = 0
         cloud_pixel_count = 0
         started = time.perf_counter()
+        power_sampler = PowerSampler(
+            power_sensor,
+            sample_interval_seconds=power_sample_interval,
+            unit=power_unit,
+        )
+        power_sampler.start()
 
         def flush_batch() -> None:
             nonlocal cloud_pixel_count, processed_tiles
             if not pending_patches:
                 return
             batch = np.stack(pending_patches, axis=0)
-            probabilities = _predict_probability(model, batch, resolved_device, tile_size)
+            probabilities = _predict_probability(model, batch, resolved_device, model_tile_size)
             for probability, (tile_row, tile_column) in zip(probabilities, pending_coordinates):
+                probability = probability[
+                    context_size : context_size + tile_size,
+                    context_size : context_size + tile_size,
+                ]
                 tile_mask = np.where(
                     probability >= threshold,
                     MASK_CLOUD_VALUE,
@@ -372,60 +563,98 @@ def infer_resized_4096_tiles(
                 print(f"Processed {processed_tiles}/{tile_count} tiles", flush=True)
 
         try:
-            for tile_row in range(tiles_per_axis):
-                row_start = tile_row * tile_size
-                resized_strip = _read_resized_strip(
-                    reader,
-                    output_row_start=row_start,
-                    output_row_end=row_start + tile_size,
-                    horizontal_plan=horizontal_plan,
-                    vertical_plan=vertical_plan,
-                )
-                for tile_column in range(tiles_per_axis):
-                    column_start = tile_column * tile_size
-                    patch = resized_strip[
-                        :,
-                        column_start : column_start + tile_size,
-                        :,
-                    ]
-                    normalized = _normalize_patch(patch, scale)
-                    pending_patches.append(np.transpose(normalized, (2, 0, 1)))
-                    pending_coordinates.append((tile_row, tile_column))
-                    if len(pending_patches) >= batch_size:
-                        flush_batch()
-            flush_batch()
-            if mask_stage is not None:
-                mask_stage.commit()
-        except Exception:
-            if mask_stage is not None:
-                mask_stage.abort()
-            raise
+            try:
+                for tile_row in range(tiles_per_axis):
+                    row_start = tile_row * tile_size
+                    requested_row_start = row_start - context_size
+                    requested_row_end = row_start + tile_size + context_size
+                    actual_row_start = max(requested_row_start, 0)
+                    actual_row_end = min(requested_row_end, resize_size)
+                    resized_strip = _read_resized_strip(
+                        reader,
+                        output_row_start=actual_row_start,
+                        output_row_end=actual_row_end,
+                        horizontal_plan=horizontal_plan,
+                        vertical_plan=vertical_plan,
+                    )
+                    if resized_image is not None:
+                        resized_image[actual_row_start:actual_row_end] = _cast_resized_strip(
+                            resized_strip,
+                            resized_image_stage.dtype,
+                        )
+                    resized_strip = _pad_context_strip(
+                        resized_strip,
+                        requested_start=requested_row_start,
+                        requested_end=requested_row_end,
+                        actual_start=actual_row_start,
+                        actual_end=actual_row_end,
+                    )
+                    for tile_column in range(tiles_per_axis):
+                        column_start = tile_column * tile_size
+                        patch = _extract_context_patch(
+                            resized_strip,
+                            column_start=column_start,
+                            tile_size=tile_size,
+                            context_size=context_size,
+                            image_width=resize_size,
+                        )
+                        normalized = _normalize_patch(patch, scale)
+                        pending_patches.append(np.transpose(normalized, (2, 0, 1)))
+                        pending_coordinates.append((tile_row, tile_column))
+                        if len(pending_patches) >= batch_size:
+                            flush_batch()
+                flush_batch()
+                if mask_stage is not None:
+                    mask_stage.commit()
+                if resized_image_stage is not None:
+                    resized_image_stage.commit()
+            except Exception:
+                if mask_stage is not None:
+                    mask_stage.abort()
+                if resized_image_stage is not None:
+                    resized_image_stage.abort()
+                raise
+        finally:
+            power_metrics = power_sampler.stop()
 
         elapsed = time.perf_counter() - started
+        cloud_ratio = float(cloud_pixel_count / (resize_size * resize_size))
         return {
             "image": str(image_path),
             "checkpoint": str(checkpoint_path),
             "output_mode": output_mode,
             "mask": str(output_mask_path) if output_mask_path is not None else None,
+            "resized_image": str(resized_image_path) if resized_image_path is not None else None,
+            "resized_image_dtype": (
+                str(resized_image_stage.dtype) if resized_image_stage is not None else None
+            ),
             "mask_tiles": [str(path) for path in output_tile_paths.values()],
             "device": str(resolved_device),
             "image_shape": [source_height, source_width, channels],
             "resized_image_shape": [resize_size, resize_size, channels],
             "resize_method": "bilinear",
             "tile_size": tile_size,
+            "context_size": context_size,
+            "model_tile_size": model_tile_size,
             "tiles_per_axis": tiles_per_axis,
             "tile_count": tile_count,
             "batch_size": batch_size,
             "threshold": threshold,
             "input_scale": scale,
             "cloud_pixel_count": cloud_pixel_count,
-            "cloud_ratio": float(cloud_pixel_count / (resize_size * resize_size)),
+            "cloud_ratio": cloud_ratio,
+            "cloud_percentage": (
+                float(cloud_ratio * 100.0)
+                if output_mode == OUTPUT_MODE_MERGED
+                else None
+            ),
             "mask_bigtiff": mask_stage.bigtiff if mask_stage is not None else None,
             "reader_backend": getattr(reader, "backend", "unknown"),
             "reader_metrics": (
                 reader.metrics.as_dict() if hasattr(reader, "metrics") else None
             ),
             "elapsed_seconds": round(elapsed, 3),
+            "power": power_metrics,
         }
 
 
@@ -446,7 +675,35 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-mask", default=None, help="Merged output uint8 TIFF/BigTIFF mask")
     parser.add_argument("--output-dir", default=None, help="Directory for individual mask tiles")
+    parser.add_argument(
+        "--output-resized-image",
+        default=None,
+        help="Optional resized RGB comparison TIFF",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=DEFAULT_CONTEXT_SIZE,
+        help="Context pixels added on each side of every 1024 output tile",
+    )
+    parser.add_argument(
+        "--power-sensor",
+        default=None,
+        help="Jetson power sensor file, usually an INA3221 power*_input sysfs path",
+    )
+    parser.add_argument(
+        "--power-sample-interval",
+        type=float,
+        default=0.1,
+        help="Power sampling interval in seconds",
+    )
+    parser.add_argument(
+        "--power-unit",
+        choices=("uw", "mw", "w"),
+        default="uw",
+        help="Unit reported by the power sensor: microwatts, milliwatts, or watts",
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--input-scale", type=float, default=None)
@@ -471,7 +728,12 @@ def main() -> None:
         output_mode=args.output_mode,
         output_mask=args.output_mask,
         output_dir=args.output_dir,
+        output_resized_image=args.output_resized_image,
         batch_size=args.batch_size,
+        context_size=args.context_size,
+        power_sensor=args.power_sensor,
+        power_sample_interval=args.power_sample_interval,
+        power_unit=args.power_unit,
         threshold=args.threshold,
         device=args.device,
         input_scale=args.input_scale,
@@ -486,6 +748,16 @@ def main() -> None:
         input_sidecar=args.input_sidecar,
         progress_every=args.progress_every,
     )
+    if args.output_mode == OUTPUT_MODE_MERGED:
+        print(f"Cloud percentage: {result['cloud_percentage']:.2f}%", flush=True)
+    if result["power"] is not None:
+        power = result["power"]
+        print(
+            f"Energy: {power['energy_joules']:.3f} J "
+            f"({power['energy_watt_hours']:.6f} Wh); "
+            f"average power: {power['average_power_watts']:.3f} W",
+            flush=True,
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
